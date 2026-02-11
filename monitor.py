@@ -19,7 +19,9 @@ import apprise
 
 YNAB_API_TOKEN = os.environ.get("YNAB_API_TOKEN", "")
 YNAB_BUDGET_ID = os.environ.get("YNAB_BUDGET_ID", "last-used")
-YNAB_ACCOUNT_ID = os.environ.get("YNAB_ACCOUNT_ID", "")
+# Support single ID or comma-separated list for monitoring multiple accounts
+_account_id_raw = os.environ.get("YNAB_ACCOUNT_ID", "")
+YNAB_ACCOUNT_IDS = [aid.strip() for aid in _account_id_raw.split(",") if aid.strip()]
 YNAB_CC_CATEGORIES = os.environ.get("YNAB_CC_CATEGORIES", "")  # comma-separated IDs, empty = all
 MONITOR_DAYS = os.environ.get("MONITOR_DAYS", "")  # empty = end of current month
 MIN_BALANCE = int(os.environ.get("MIN_BALANCE", "0"))  # in dollars
@@ -73,14 +75,32 @@ def get_end_date():
     return date(today.year, today.month, last_day)
 
 
-def get_account_balance():
-    """Get the current balance of the monitored account."""
-    data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts/{YNAB_ACCOUNT_ID}")
-    account = data["account"]
-    balance = milliunits_to_dollars(account["balance"])
-    print(f"Account: {account['name']}")
-    print(f"Current balance: ${balance:,.2f}")
-    return balance
+def get_account_balances():
+    """Get current balances for all monitored accounts.
+
+    Returns tuple of (total_balance, list of account details).
+    Supports single account or multiple comma-separated accounts.
+    """
+    total_balance = 0.0
+    accounts = []
+
+    for account_id in YNAB_ACCOUNT_IDS:
+        data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts/{account_id}")
+        account = data["account"]
+        balance = milliunits_to_dollars(account["balance"])
+        accounts.append({
+            "id": account_id,
+            "name": account["name"],
+            "balance": balance,
+        })
+        total_balance += balance
+        print(f"Account: {account['name']}")
+        print(f"  Balance: ${balance:,.2f}")
+
+    if len(accounts) > 1:
+        print(f"Combined balance: ${total_balance:,.2f}")
+
+    return total_balance, accounts
 
 
 def _add_months(d, months):
@@ -166,7 +186,7 @@ def get_scheduled_transactions(end_date):
 
     transactions = []
     for txn in data["scheduled_transactions"]:
-        if txn["account_id"] != YNAB_ACCOUNT_ID:
+        if txn["account_id"] not in YNAB_ACCOUNT_IDS:
             continue
         if txn.get("deleted", False):
             continue
@@ -358,8 +378,8 @@ def validate_config():
     errors = []
     if not YNAB_API_TOKEN:
         errors.append("YNAB_API_TOKEN is required")
-    if not YNAB_ACCOUNT_ID:
-        errors.append("YNAB_ACCOUNT_ID is required")
+    if not YNAB_ACCOUNT_IDS:
+        errors.append("YNAB_ACCOUNT_ID is required (single ID or comma-separated list)")
     if not APPRISE_URLS:
         errors.append("APPRISE_URLS is required")
     if errors:
@@ -382,9 +402,9 @@ def run_check(send_update=False):
     print(f"Projecting through {end_date}, threshold: ${MIN_BALANCE:,.2f}")
     print("=" * 60)
 
-    balance = get_account_balance()
+    balance, accounts = get_account_balances()
     transactions = get_scheduled_transactions(end_date)
-    cc_payments, cc_total = get_cc_payment_amounts()
+    cc_payments, _ = get_cc_payment_amounts()
     min_balance, min_date = project_minimum_balance(balance, transactions, cc_payments, end_date)
 
     if min_balance < MIN_BALANCE:
