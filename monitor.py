@@ -30,6 +30,7 @@ SCHEDULE = os.environ.get("SCHEDULE", "")  # e.g. "08:00" for daily at 8am, "6h"
 UPDATE_SCHEDULE = os.environ.get("UPDATE_SCHEDULE", "")  # when to send routine balance update notifications
 UPDATE_APPRISE_URLS = os.environ.get("UPDATE_APPRISE_URLS", "")  # defaults to APPRISE_URLS if empty
 TZ = os.environ.get("TZ", "")
+DRY_RUN = os.environ.get("DRY_RUN", "").lower() in ("true", "1", "yes")
 
 YNAB_BASE = "https://api.ynab.com/v1"
 
@@ -51,6 +52,40 @@ def ynab_get(path):
     except URLError as e:
         print(f"Network error: {e.reason}", file=sys.stderr)
         sys.exit(1)
+
+
+def ynab_put(path, payload):
+    """Make an authenticated PUT request to the YNAB API."""
+    url = f"{YNAB_BASE}{path}"
+    data = json.dumps(payload).encode()
+    req = Request(url, data=data, method="PUT", headers={
+        "Authorization": f"Bearer {YNAB_API_TOKEN}",
+        "Content-Type": "application/json"
+    })
+    try:
+        with urlopen(req) as resp:
+            return json.loads(resp.read().decode())["data"]
+    except HTTPError as e:
+        body = e.read().decode()
+        print(f"YNAB API PUT error ({e.code}): {body}", file=sys.stderr)
+        raise
+
+
+def ynab_post(path, payload):
+    """Make an authenticated POST request to the YNAB API."""
+    url = f"{YNAB_BASE}{path}"
+    data = json.dumps(payload).encode()
+    req = Request(url, data=data, method="POST", headers={
+        "Authorization": f"Bearer {YNAB_API_TOKEN}",
+        "Content-Type": "application/json"
+    })
+    try:
+        with urlopen(req) as resp:
+            return json.loads(resp.read().decode())["data"]
+    except HTTPError as e:
+        body = e.read().decode()
+        print(f"YNAB API POST error ({e.code}): {body}", file=sys.stderr)
+        raise
 
 
 def milliunits_to_dollars(milliunits):
@@ -264,6 +299,103 @@ def get_cc_payment_amounts():
     return cc_payments, total
 
 
+def get_cc_payment_history(cc_account_id, months_back=6):
+    """Get historical CC payment transactions to determine typical pay date.
+
+    Looks at transfers FROM checking TO this CC account.
+    Returns the most common day-of-month for payments, or None if no history.
+    """
+    from collections import Counter
+
+    since_date = (datetime.now() - timedelta(days=months_back * 30)).strftime("%Y-%m-%d")
+    data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts/{cc_account_id}/transactions?since_date={since_date}")
+
+    pay_days = []
+    for txn in data.get("transactions", []):
+        if txn.get("deleted"):
+            continue
+        # Payment = transfer from checking (positive amount from CC's perspective)
+        if txn["amount"] > 0 and txn.get("transfer_account_id") in YNAB_ACCOUNT_IDS:
+            pay_date = datetime.strptime(txn["date"], "%Y-%m-%d").date()
+            pay_days.append(pay_date.day)
+
+    if not pay_days:
+        return None
+
+    return Counter(pay_days).most_common(1)[0][0]
+
+
+def ensure_cc_payment_scheduled(cc_account_id, cc_name, category_balance, checking_account_id):
+    """Ensure a scheduled payment exists for this CC with correct amount.
+
+    - If scheduled payment exists with wrong amount: update it
+    - If no scheduled payment exists: create one using historical pay date
+    """
+    # Get existing scheduled transactions
+    data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions")
+
+    existing = None
+    for txn in data["scheduled_transactions"]:
+        if txn.get("deleted"):
+            continue
+        # Find transfer from checking to this CC
+        if (txn["account_id"] == checking_account_id and
+            txn.get("transfer_account_id") == cc_account_id):
+            existing = txn
+            break
+
+    # Amount in milliunits, negative = outflow from checking
+    amount_milliunits = int(category_balance * -1000)
+
+    if existing:
+        current_amount = existing["amount"]
+        if current_amount != amount_milliunits:
+            old_dollars = current_amount / -1000
+            if DRY_RUN:
+                print(f"  [DRY-RUN] Would update {cc_name}: ${old_dollars:,.2f} -> ${category_balance:,.2f}")
+            else:
+                print(f"  Updating {cc_name}: ${old_dollars:,.2f} -> ${category_balance:,.2f}")
+                ynab_put(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions/{existing['id']}", {
+                    "scheduled_transaction": {
+                        "amount": amount_milliunits
+                    }
+                })
+        else:
+            print(f"  {cc_name}: already correct at ${category_balance:,.2f}")
+    else:
+        # Create new scheduled payment using historical pay date
+        pay_day = get_cc_payment_history(cc_account_id) or 1
+
+        # Calculate next occurrence of pay_day
+        today = datetime.now().date()
+        if today.day <= pay_day:
+            try:
+                next_pay = today.replace(day=pay_day)
+            except ValueError:
+                # Day doesn't exist in this month, use last day
+                next_pay = today.replace(day=calendar.monthrange(today.year, today.month)[1])
+        else:
+            next_month = _add_months(today, 1)
+            last_day = calendar.monthrange(next_month.year, next_month.month)[1]
+            next_pay = next_month.replace(day=min(pay_day, last_day))
+
+        if DRY_RUN:
+            print(f"  [DRY-RUN] Would create {cc_name}: ${category_balance:,.2f} on {next_pay} (day {pay_day} from history)")
+        else:
+            print(f"  Creating {cc_name}: ${category_balance:,.2f} on {next_pay} (day {pay_day} from history)")
+            ynab_post(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions", {
+                "scheduled_transaction": {
+                    "account_id": checking_account_id,
+                    "date": next_pay.strftime("%Y-%m-%d"),
+                    "amount": amount_milliunits,
+                    "payee_id": None,
+                    "transfer_account_id": cc_account_id,
+                    "memo": "Auto-scheduled by YNAB Monitor",
+                    "frequency": "monthly"
+                }
+            })
+
+
 def project_minimum_balance(current_balance, scheduled_transactions, cc_payments, end_date):
     """Walk day-by-day to find the minimum projected balance.
 
@@ -405,6 +537,15 @@ def run_check(send_update=False):
     balance, accounts = get_account_balances()
     transactions = get_scheduled_transactions(end_date)
     cc_payments, _ = get_cc_payment_amounts()
+
+    # Ensure CC payments are scheduled correctly
+    if YNAB_ACCOUNT_IDS:
+        print("\nChecking CC payment schedules...")
+        checking_id = YNAB_ACCOUNT_IDS[0]  # Primary checking account
+        for cc_id, payment_info in cc_payments.items():
+            if payment_info["amount"] > 0:
+                ensure_cc_payment_scheduled(cc_id, payment_info["name"], payment_info["amount"], checking_id)
+
     min_balance, min_date = project_minimum_balance(balance, transactions, cc_payments, end_date)
 
     if min_balance < MIN_BALANCE:
