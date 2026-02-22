@@ -47,7 +47,7 @@ The container runs as a long-lived service and checks on your configured schedul
 docker compose run --rm monitor
 
 # Or without Docker:
-python monitor.py
+python ynab_balance_monitor.py
 ```
 
 ## Configuration
@@ -59,7 +59,9 @@ python monitor.py
 | `YNAB_BUDGET_ID` | No | `last-used` | Budget ID (or `last-used`) |
 | `YNAB_CC_CATEGORIES` | No | all | Comma-separated category IDs or names to monitor |
 | `MONITOR_DAYS` | No | end of month | Number of days to project forward (leave empty for end of current month) |
-| `MIN_BALANCE` | No | `0` | Alert threshold in dollars |
+| `MIN_BALANCE` | No | `0` | Minimum threshold floor in dollars (serves as floor for dynamic thresholds) |
+| `YNAB_TARGET_BUFFER_DAYS` | No | `10` | Target buffer — days of average daily expenses the projected minimum should cover |
+| `YNAB_ALERT_BUFFER_DAYS` | No | `5` | Alert buffer — fire alert if projected minimum covers fewer than this many days |
 | `SCHEDULE` | No | — | `HH:MM` for daily at that time, or `Nh` for every N hours. Empty = run once and exit |
 | `UPDATE_SCHEDULE` | No | — | Same format as `SCHEDULE`. When set, sends a routine balance update notification on this cadence, independent of `SCHEDULE` |
 | `APPRISE_URLS` | Yes | — | Comma-separated [Apprise URLs](https://github.com/caronc/apprise/wiki) for alert notifications |
@@ -71,7 +73,7 @@ python monitor.py
 ```
 ============================================================
 YNAB Balance Monitor — 2026-02-07 08:00
-Projecting through 2026-02-28, threshold: $500.00
+Projecting through 2026-02-28, min floor: $500.00
 ============================================================
 Account: Primary Checking
 Current balance: $2,450.00
@@ -85,10 +87,13 @@ Credit card payments to account for: $1,200.00
   Chase Sapphire                              $    800.00
   Amex Gold                                   $    400.00
 
+Trailing 13-month expenses: $38,400.00 (avg $2,953.85/mo, $97.03/day)
+Alert threshold (5 days): $500.00
+Target threshold (10 days): $1,000.00
+
 Unscheduled CC payments (applied today): $1,200.00
 
-Projected minimum balance: $-250.00 on 2026-02-10
+Projected minimum balance: $950.00 on 2026-02-10
 
-⚠ ALERT: Projected balance drops $750.00 below threshold!
-Notification sent to my-balance-alerts
+✓ On track (950.00 ≥ alert threshold of 500.00)
 ```

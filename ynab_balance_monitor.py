@@ -24,8 +24,11 @@ _account_id_raw = os.environ.get("YNAB_ACCOUNT_ID", "")
 YNAB_ACCOUNT_IDS = [aid.strip() for aid in _account_id_raw.split(",") if aid.strip()]
 YNAB_CC_CATEGORIES = os.environ.get("YNAB_CC_CATEGORIES", "")  # comma-separated IDs, empty = all
 YNAB_CC_CLOSE_DATES = os.environ.get("YNAB_CC_CLOSE_DATES", "")  # CardName:DayOfMonth pairs
+YNAB_CC_CREATE_PAYMENTS = os.environ.get("YNAB_CC_CREATE_PAYMENTS", "").lower() in ("true", "1", "yes")
 MONITOR_DAYS = os.environ.get("MONITOR_DAYS", "")  # empty = end of current month
 MIN_BALANCE = int(os.environ.get("MIN_BALANCE", "0"))  # in dollars
+YNAB_TARGET_BUFFER_DAYS = int(os.environ.get("YNAB_TARGET_BUFFER_DAYS", "10"))
+YNAB_ALERT_BUFFER_DAYS = int(os.environ.get("YNAB_ALERT_BUFFER_DAYS", "5"))
 APPRISE_URLS = os.environ.get("APPRISE_URLS", "")  # comma-separated Apprise URLs
 SCHEDULE = os.environ.get("SCHEDULE", "")  # e.g. "08:00" for daily at 8am, "6h" for every 6 hours
 UPDATE_SCHEDULE = os.environ.get("UPDATE_SCHEDULE", "")  # when to send routine balance update notifications
@@ -358,12 +361,39 @@ def get_cc_payment_amounts():
     return cc_payments, total
 
 
+def get_cc_payment_history(cc_account_id, months_back=6):
+    """Get historical CC payment transactions to determine typical pay date.
+
+    Looks at transfers FROM checking TO this CC account.
+    Returns the most common day-of-month for payments, or None if no history.
+    """
+    from collections import Counter
+
+    since_date = (datetime.now() - timedelta(days=months_back * 30)).strftime("%Y-%m-%d")
+    data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts/{cc_account_id}/transactions?since_date={since_date}")
+
+    pay_days = []
+    for txn in data.get("transactions", []):
+        if txn.get("deleted"):
+            continue
+        # Payment = transfer from checking (positive amount from CC's perspective)
+        if txn["amount"] > 0 and txn.get("transfer_account_id") in YNAB_ACCOUNT_IDS:
+            pay_date = datetime.strptime(txn["date"], "%Y-%m-%d").date()
+            pay_days.append(pay_date.day)
+
+    if not pay_days:
+        return None
+
+    return Counter(pay_days).most_common(1)[0][0]
+
+
 def update_cc_payment_amount(cc_account_id, cc_name, payment_amount, checking_account_id):
     """Update the scheduled payment amount for a CC if it differs.
 
     Finds existing scheduled transfer from checking to this CC.
     If found and amount differs: PUT update.
-    If not found: log warning and skip (no auto-creation).
+    If not found and YNAB_CC_CREATE_PAYMENTS is enabled: create using
+    historical pay date analysis. Otherwise: log warning and skip.
     """
     data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions")
 
@@ -411,7 +441,40 @@ def update_cc_payment_amount(cc_account_id, cc_name, payment_amount, checking_ac
         else:
             print(f"  {cc_name}: already correct at ${payment_amount:,.2f}")
     else:
-        print(f"  Warning: no scheduled payment found for {cc_name}, skipping")
+        if YNAB_CC_CREATE_PAYMENTS:
+            pay_day = get_cc_payment_history(cc_account_id)
+            if pay_day is None:
+                print(f"  Warning: no payment history found for {cc_name}, cannot determine pay date — skipping creation")
+            else:
+                # Calculate next occurrence of pay_day
+                today = datetime.now().date()
+                if today.day <= pay_day:
+                    try:
+                        next_pay = today.replace(day=pay_day)
+                    except ValueError:
+                        next_pay = today.replace(day=calendar.monthrange(today.year, today.month)[1])
+                else:
+                    next_month = _add_months(today, 1)
+                    last_day = calendar.monthrange(next_month.year, next_month.month)[1]
+                    next_pay = next_month.replace(day=min(pay_day, last_day))
+
+                if DRY_RUN:
+                    print(f"  [DRY-RUN] Would create {cc_name}: ${payment_amount:,.2f} on {next_pay} (day {pay_day} from history)")
+                else:
+                    print(f"  Creating {cc_name}: ${payment_amount:,.2f} on {next_pay} (day {pay_day} from history)")
+                    ynab_post(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions", {
+                        "scheduled_transaction": {
+                            "account_id": checking_account_id,
+                            "date": next_pay.strftime("%Y-%m-%d"),
+                            "amount": amount_milliunits,
+                            "payee_id": None,
+                            "transfer_account_id": cc_account_id,
+                            "memo": "Auto-scheduled by YNAB Monitor",
+                            "frequency": "monthly"
+                        }
+                    })
+        else:
+            print(f"  Warning: no scheduled payment found for {cc_name}, skipping")
 
 
 def project_minimum_balance(current_balance, scheduled_transactions, cc_payments, end_date):
@@ -466,6 +529,68 @@ def project_minimum_balance(current_balance, scheduled_transactions, cc_payments
     return min_balance, min_date
 
 
+def calculate_monthly_expenses():
+    """Calculate average monthly expenses from trailing 13 months of YNAB data.
+
+    Fetches MonthDetail for each of the last 13 complete months, sums negative
+    category activity (excluding CC payment and internal categories), and
+    returns the average.  13 months captures seasonal variation and ensures
+    every calendar month is represented at least once.
+
+    Returns (avg_daily_expenses, avg_monthly_expenses).
+    """
+    today = datetime.now().date()
+    first_of_month = date(today.year, today.month, 1)
+    skip_groups = {"Credit Card Payments", "Internal Master Category"}
+
+    monthly_totals = []
+    for i in range(1, 14):  # 1..13 months back
+        month_start = _add_months(first_of_month, -i)
+        month_str = month_start.strftime("%Y-%m-01")
+        data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/months/{month_str}")
+        month_detail = data["month"]
+
+        total = 0.0
+        for cat in month_detail["categories"]:
+            if cat.get("deleted", False) or cat.get("hidden", False):
+                continue
+            if cat.get("category_group_name", "") in skip_groups:
+                continue
+            activity = milliunits_to_dollars(cat["activity"])
+            if activity < 0:
+                total += abs(activity)
+
+        monthly_totals.append((month_start, total))
+
+    avg_monthly = sum(t for _, t in monthly_totals) / len(monthly_totals)
+    avg_daily = avg_monthly / 30.44  # average days per month
+
+    print(f"\nTrailing 13-month expenses:")
+    for month_start, total in monthly_totals:
+        print(f"  {month_start.strftime('%b %Y'):>10s}  ${total:>10,.2f}")
+    print(f"  {'Average':>10s}  ${avg_monthly:>10,.2f}/mo  (${avg_daily:,.2f}/day)")
+
+    return avg_daily, avg_monthly
+
+
+def get_dynamic_thresholds(avg_daily_expenses):
+    """Compute alert and target thresholds for the projected minimum.
+
+    The projected minimum is the balance AFTER all known obligations clear.
+    Thresholds represent how many days of average spending that cushion
+    should cover for unplanned expenses:
+    - alert: YNAB_ALERT_BUFFER_DAYS (default 5) — transfer from HYSA now
+    - target: YNAB_TARGET_BUFFER_DAYS (default 10) — consider transferring
+
+    MIN_BALANCE is used as a floor.
+
+    Returns (alert_threshold, target_threshold).
+    """
+    alert_threshold = round(max(MIN_BALANCE, avg_daily_expenses * YNAB_ALERT_BUFFER_DAYS), -2)
+    target_threshold = round(max(MIN_BALANCE, avg_daily_expenses * YNAB_TARGET_BUFFER_DAYS), -2)
+    return alert_threshold, target_threshold
+
+
 # ---------------------------------------------------------------------------
 # Notification
 # ---------------------------------------------------------------------------
@@ -480,13 +605,15 @@ def _build_notifier(urls_str):
     return notifier
 
 
-def send_alert_notification(min_balance, min_date):
+def send_alert_notification(min_balance, min_date, alert_threshold, target_threshold, avg_monthly):
     """Send a below-threshold alert via Apprise."""
     title = "YNAB Balance Alert"
     message = (
         f"Your checking account balance is projected to drop to "
-        f"${min_balance:,.2f} by {min_date.strftime('%b %d, %Y')}. "
-        f"Minimum threshold: ${MIN_BALANCE:,.2f}."
+        f"${min_balance:,.2f} by {min_date.strftime('%b %d, %Y')}.\n"
+        f"Avg monthly expenses: ${avg_monthly:,.0f}\n"
+        f"Alert ({YNAB_ALERT_BUFFER_DAYS}d): ${alert_threshold:,.0f} | "
+        f"Target ({YNAB_TARGET_BUFFER_DAYS}d): ${target_threshold:,.0f}"
     )
 
     notifier = _build_notifier(APPRISE_URLS)
@@ -499,19 +626,26 @@ def send_alert_notification(min_balance, min_date):
     print("\nAlert notification sent via Apprise")
 
 
-def send_update_notification(min_balance, min_date, end_date):
+def send_update_notification(min_balance, min_date, end_date, alert_threshold, target_threshold, avg_monthly):
     """Send a routine projected-balance update via Apprise."""
     title = "YNAB Balance Update"
-    status = "below threshold" if min_balance < MIN_BALANCE else "on track"
+    if min_balance < alert_threshold:
+        status = "BELOW THRESHOLD"
+    elif min_balance < target_threshold:
+        status = "below target"
+    else:
+        status = "on track"
     message = (
         f"Projected minimum: ${min_balance:,.2f} on {min_date.strftime('%b %d')} "
-        f"(through {end_date.strftime('%b %d, %Y')}). "
-        f"Threshold: ${MIN_BALANCE:,.2f} — {status}."
+        f"(through {end_date.strftime('%b %d, %Y')}).\n"
+        f"Avg monthly expenses: ${avg_monthly:,.0f}\n"
+        f"Alert ({YNAB_ALERT_BUFFER_DAYS}d): ${alert_threshold:,.0f} | "
+        f"Target ({YNAB_TARGET_BUFFER_DAYS}d): ${target_threshold:,.0f} — {status}."
     )
 
     urls = UPDATE_APPRISE_URLS or APPRISE_URLS
     notifier = _build_notifier(urls)
-    notify_type = apprise.NotifyType.WARNING if min_balance < MIN_BALANCE else apprise.NotifyType.SUCCESS
+    notify_type = apprise.NotifyType.WARNING if min_balance < alert_threshold else apprise.NotifyType.SUCCESS
 
     if not notifier.notify(title=title, body=message, notify_type=notify_type):
         print("Failed to send update notification via Apprise", file=sys.stderr)
@@ -541,15 +675,15 @@ def validate_config():
 def run_check(send_update=False):
     """Run one balance check cycle.
 
-    Always evaluates the alert threshold and fires an alert notification if
-    the projected minimum falls below MIN_BALANCE.  When send_update is True,
-    also fires a routine update notification regardless of the threshold.
+    Computes dynamic alert/target thresholds from monthly outflows and fires
+    an alert if the projected minimum falls below the alert threshold.
+    When send_update is True, also fires a routine update notification.
     """
     end_date = get_end_date()
 
     print("=" * 60)
     print(f"YNAB Balance Monitor — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f"Projecting through {end_date}, threshold: ${MIN_BALANCE:,.2f}")
+    print(f"Projecting through {end_date}, min floor: ${MIN_BALANCE:,.2f}")
     print("=" * 60)
 
     balance, accounts = get_account_balances()
@@ -564,17 +698,23 @@ def run_check(send_update=False):
             if payment_info["amount"] > 0:
                 update_cc_payment_amount(cc_id, payment_info["name"], payment_info["amount"], checking_id)
 
+    # Calculate dynamic thresholds based on last month's actual expenses
+    avg_daily, avg_monthly = calculate_monthly_expenses()
+    alert_threshold, target_threshold = get_dynamic_thresholds(avg_daily)
+    print(f"Alert threshold ({YNAB_ALERT_BUFFER_DAYS}d): ${alert_threshold:,.0f}")
+    print(f"Target threshold ({YNAB_TARGET_BUFFER_DAYS}d): ${target_threshold:,.0f}")
+
     min_balance, min_date = project_minimum_balance(balance, transactions, cc_payments, end_date)
 
-    if min_balance < MIN_BALANCE:
-        shortfall = MIN_BALANCE - min_balance
-        print(f"\n⚠ ALERT: Projected balance drops ${shortfall:,.2f} below threshold!")
-        send_alert_notification(min_balance, min_date)
+    if min_balance < alert_threshold:
+        shortfall = alert_threshold - min_balance
+        print(f"\n⚠ ALERT: Projected balance drops ${shortfall:,.0f} below alert threshold!")
+        send_alert_notification(min_balance, min_date, alert_threshold, target_threshold, avg_monthly)
     else:
-        print(f"\n✓ Balance stays above ${MIN_BALANCE:,.2f} threshold.")
+        print(f"\n✓ Balance stays above ${alert_threshold:,.0f} alert threshold.")
 
     if send_update:
-        send_update_notification(min_balance, min_date, end_date)
+        send_update_notification(min_balance, min_date, end_date, alert_threshold, target_threshold, avg_monthly)
 
 
 # ---------------------------------------------------------------------------
