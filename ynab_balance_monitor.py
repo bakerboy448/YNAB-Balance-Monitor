@@ -605,15 +605,15 @@ def _build_notifier(urls_str):
     return notifier
 
 
-def send_alert_notification(min_balance, min_date, alert_threshold, target_threshold, avg_monthly):
+def send_alert_notification(current_balance, min_balance, min_date, alert_threshold, target_threshold):
     """Send a below-threshold alert via Apprise."""
-    title = "YNAB Balance Alert"
+    shortfall = alert_threshold - min_balance
+    title = f"Transfer ${shortfall:,.0f} to checking"
     message = (
-        f"Your checking account balance is projected to drop to "
-        f"${min_balance:,.2f} by {min_date.strftime('%b %d, %Y')}.\n"
-        f"Avg monthly expenses: ${avg_monthly:,.0f}\n"
-        f"Alert ({YNAB_ALERT_BUFFER_DAYS}d): ${alert_threshold:,.0f} | "
-        f"Target ({YNAB_TARGET_BUFFER_DAYS}d): ${target_threshold:,.0f}"
+        f"Projected minimum ${min_balance:,.0f} on {min_date.strftime('%b %d')} "
+        f"is ${shortfall:,.0f} below the ${alert_threshold:,.0f} alert threshold.\n"
+        f"Current balance: ${current_balance:,.0f}\n"
+        f"Target: ${target_threshold:,.0f}"
     )
 
     notifier = _build_notifier(APPRISE_URLS)
@@ -626,21 +626,22 @@ def send_alert_notification(min_balance, min_date, alert_threshold, target_thres
     print("\nAlert notification sent via Apprise")
 
 
-def send_update_notification(min_balance, min_date, end_date, alert_threshold, target_threshold, avg_monthly):
+def send_update_notification(current_balance, min_balance, min_date, end_date, alert_threshold, target_threshold):
     """Send a routine projected-balance update via Apprise."""
-    title = "YNAB Balance Update"
     if min_balance < alert_threshold:
-        status = "BELOW THRESHOLD"
+        status = "BELOW ALERT"
+        title = f"Checking: ${min_balance:,.0f} min — {status}"
     elif min_balance < target_threshold:
         status = "below target"
+        title = f"Checking: ${min_balance:,.0f} min — {status}"
     else:
         status = "on track"
+        title = f"Checking: ${min_balance:,.0f} min — {status}"
     message = (
-        f"Projected minimum: ${min_balance:,.2f} on {min_date.strftime('%b %d')} "
-        f"(through {end_date.strftime('%b %d, %Y')}).\n"
-        f"Avg monthly expenses: ${avg_monthly:,.0f}\n"
-        f"Alert ({YNAB_ALERT_BUFFER_DAYS}d): ${alert_threshold:,.0f} | "
-        f"Target ({YNAB_TARGET_BUFFER_DAYS}d): ${target_threshold:,.0f} — {status}."
+        f"Current: ${current_balance:,.0f} | "
+        f"Min: ${min_balance:,.0f} on {min_date.strftime('%b %d')}\n"
+        f"Alert: ${alert_threshold:,.0f} | Target: ${target_threshold:,.0f}\n"
+        f"Through {end_date.strftime('%b %d, %Y')}"
     )
 
     urls = UPDATE_APPRISE_URLS or APPRISE_URLS
@@ -709,12 +710,12 @@ def run_check(send_update=False):
     if min_balance < alert_threshold:
         shortfall = alert_threshold - min_balance
         print(f"\n⚠ ALERT: Projected balance drops ${shortfall:,.0f} below alert threshold!")
-        send_alert_notification(min_balance, min_date, alert_threshold, target_threshold, avg_monthly)
+        send_alert_notification(balance, min_balance, min_date, alert_threshold, target_threshold)
     else:
         print(f"\n✓ Balance stays above ${alert_threshold:,.0f} alert threshold.")
 
     if send_update:
-        send_update_notification(min_balance, min_date, end_date, alert_threshold, target_threshold, avg_monthly)
+        send_update_notification(balance, min_balance, min_date, end_date, alert_threshold, target_threshold)
 
 
 # ---------------------------------------------------------------------------
