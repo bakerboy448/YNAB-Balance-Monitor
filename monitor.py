@@ -23,6 +23,7 @@ YNAB_BUDGET_ID = os.environ.get("YNAB_BUDGET_ID", "last-used")
 _account_id_raw = os.environ.get("YNAB_ACCOUNT_ID", "")
 YNAB_ACCOUNT_IDS = [aid.strip() for aid in _account_id_raw.split(",") if aid.strip()]
 YNAB_CC_CATEGORIES = os.environ.get("YNAB_CC_CATEGORIES", "")  # comma-separated IDs, empty = all
+YNAB_CC_CLOSE_DATES = os.environ.get("YNAB_CC_CLOSE_DATES", "")  # CardName:DayOfMonth pairs
 MONITOR_DAYS = os.environ.get("MONITOR_DAYS", "")  # empty = end of current month
 MIN_BALANCE = int(os.environ.get("MIN_BALANCE", "0"))  # in dollars
 APPRISE_URLS = os.environ.get("APPRISE_URLS", "")  # comma-separated Apprise URLs
@@ -91,6 +92,37 @@ def ynab_post(path, payload):
 def milliunits_to_dollars(milliunits):
     """YNAB stores amounts in milliunits (1 dollar = 1000 milliunits)."""
     return milliunits / 1000.0
+
+
+def parse_cc_close_dates():
+    """Parse YNAB_CC_CLOSE_DATES into {card_name: close_day} dict.
+
+    Format: "CardName:DayOfMonth,CardName2:DayOfMonth2"
+    Validates day is 1-28 (avoids month-length edge cases).
+    """
+    if not YNAB_CC_CLOSE_DATES:
+        return {}
+    result = {}
+    for pair in YNAB_CC_CLOSE_DATES.split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if ":" not in pair:
+            print(f"Warning: invalid CC close date entry (missing ':'): '{pair}'", file=sys.stderr)
+            continue
+        # Split on last colon only (card names may contain colons)
+        name, day_str = pair.rsplit(":", 1)
+        name = name.strip()
+        try:
+            day = int(day_str.strip())
+        except ValueError:
+            print(f"Warning: invalid day in CC close date for '{name}': '{day_str}'", file=sys.stderr)
+            continue
+        if day < 1 or day > 28:
+            print(f"Warning: CC close day for '{name}' must be 1-28, got {day}", file=sys.stderr)
+            continue
+        result[name] = day
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -252,86 +284,87 @@ def get_scheduled_transactions(end_date):
 
 
 def get_cc_payment_amounts():
-    """Get credit card payment category available balances.
+    """Get credit card payment amounts.
 
-    Returns a dict of {account_id: available_amount} for credit card accounts,
-    and the total amount to be paid.
+    For cards with configured close dates in YNAB_CC_CLOSE_DATES: uses the
+    account's cleared_balance (approximates statement balance).
+    For cards without: falls back to category balance (original behavior).
+
+    Returns a dict of {account_id: {name, amount}} and the total.
     """
-    # Get all accounts to identify credit card accounts and map category names
+    close_dates = parse_cc_close_dates()
+
+    # Get all accounts to identify CC accounts and their cleared balances
     accounts_data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts")
-    cc_accounts = {}
+    cc_accounts = {}  # name -> id
+    cc_cleared = {}   # id -> {name, cleared_balance}
     for acct in accounts_data["accounts"]:
         if acct["type"] == "creditCard" and not acct.get("deleted", False) and not acct.get("closed", False):
             cc_accounts[acct["name"]] = acct["id"]
+            cc_cleared[acct["id"]] = {
+                "name": acct["name"],
+                "cleared_balance": milliunits_to_dollars(acct["cleared_balance"]),
+            }
 
-    # Get categories and find the Credit Card Payments group
-    categories_data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/categories")
+    cc_payments = {}
 
-    # Parse user-specified CC categories filter
+    # Cards WITH close dates: use cleared_balance from account
+    for card_name, close_day in close_dates.items():
+        account_id = cc_accounts.get(card_name)
+        if not account_id:
+            print(f"  Warning: CC close date configured for '{card_name}' but no matching YNAB account found")
+            continue
+        info = cc_cleared[account_id]
+        # cleared_balance is negative on CC accounts (money owed), take absolute value
+        amount = abs(info["cleared_balance"])
+        if amount > 0:
+            cc_payments[account_id] = {
+                "name": card_name,
+                "amount": amount,
+                "source": "cleared_balance",
+            }
+
+    # Cards WITHOUT close dates: fall back to category balance
     cc_filter = set()
     if YNAB_CC_CATEGORIES:
         cc_filter = {c.strip() for c in YNAB_CC_CATEGORIES.split(",")}
 
-    cc_payments = {}
+    categories_data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/categories")
     for group in categories_data["category_groups"]:
         if group["name"] != "Credit Card Payments":
             continue
         for cat in group["categories"]:
             if cat.get("deleted", False) or cat.get("hidden", False):
                 continue
-            # If user specified specific categories, filter
             if cc_filter and cat["id"] not in cc_filter and cat["name"] not in cc_filter:
                 continue
 
-            available = milliunits_to_dollars(cat["balance"])
-            # Map category name back to account ID
             account_id = cc_accounts.get(cat["name"])
-            if account_id and available > 0:
-                cc_payments[account_id] = {
-                    "name": cat["name"],
-                    "amount": available,
-                }
+            if account_id and account_id not in cc_payments:
+                # Only use category balance for cards not already handled by close dates
+                available = milliunits_to_dollars(cat["balance"])
+                if available > 0:
+                    cc_payments[account_id] = {
+                        "name": cat["name"],
+                        "amount": available,
+                        "source": "category_balance",
+                    }
 
     total = sum(p["amount"] for p in cc_payments.values())
     print(f"\nCredit card payments to account for: ${total:,.2f}")
     for p in cc_payments.values():
-        print(f"  {p['name']:30s}  ${p['amount']:>10,.2f}")
+        source_label = f" ({p['source']})" if close_dates else ""
+        print(f"  {p['name']:30s}  ${p['amount']:>10,.2f}{source_label}")
     return cc_payments, total
 
 
-def get_cc_payment_history(cc_account_id, months_back=6):
-    """Get historical CC payment transactions to determine typical pay date.
+def update_cc_payment_amount(cc_account_id, cc_name, payment_amount, checking_account_id):
+    """Update the scheduled payment amount for a CC if it differs.
 
-    Looks at transfers FROM checking TO this CC account.
-    Returns the most common day-of-month for payments, or None if no history.
+    Finds existing scheduled transfer from checking to this CC.
+    If found and amount differs: PUT update.
+    If not found: log warning and skip (no auto-creation).
     """
-    from collections import Counter
-
-    since_date = (datetime.now() - timedelta(days=months_back * 30)).strftime("%Y-%m-%d")
-    data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts/{cc_account_id}/transactions?since_date={since_date}")
-
-    pay_days = []
-    for txn in data.get("transactions", []):
-        if txn.get("deleted"):
-            continue
-        # Payment = transfer from checking (positive amount from CC's perspective)
-        if txn["amount"] > 0 and txn.get("transfer_account_id") in YNAB_ACCOUNT_IDS:
-            pay_date = datetime.strptime(txn["date"], "%Y-%m-%d").date()
-            pay_days.append(pay_date.day)
-
-    if not pay_days:
-        return None
-
-    return Counter(pay_days).most_common(1)[0][0]
-
-
-def ensure_cc_payment_scheduled(cc_account_id, cc_name, category_balance, checking_account_id):
-    """Ensure a scheduled payment exists for this CC with correct amount.
-
-    - If scheduled payment exists with wrong amount: update it
-    - If no scheduled payment exists: create one using historical pay date
-    """
-    # Get existing scheduled transactions
     data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions")
 
     existing = None
@@ -345,16 +378,16 @@ def ensure_cc_payment_scheduled(cc_account_id, cc_name, category_balance, checki
             break
 
     # Amount in milliunits, negative = outflow from checking
-    amount_milliunits = int(category_balance * -1000)
+    amount_milliunits = int(payment_amount * -1000)
 
     if existing:
         current_amount = existing["amount"]
         if current_amount != amount_milliunits:
             old_dollars = current_amount / -1000
             if DRY_RUN:
-                print(f"  [DRY-RUN] Would update {cc_name}: ${old_dollars:,.2f} -> ${category_balance:,.2f}")
+                print(f"  [DRY-RUN] Would update {cc_name}: ${old_dollars:,.2f} -> ${payment_amount:,.2f}")
             else:
-                print(f"  Updating {cc_name}: ${old_dollars:,.2f} -> ${category_balance:,.2f}")
+                print(f"  Updating {cc_name}: ${old_dollars:,.2f} -> ${payment_amount:,.2f}")
                 # YNAB PUT requires date (future, max 1 week past) and account_id.
                 # Use date_next if valid, otherwise use today.
                 today = datetime.now().date()
@@ -376,39 +409,9 @@ def ensure_cc_payment_scheduled(cc_account_id, cc_name, category_balance, checki
                     }
                 })
         else:
-            print(f"  {cc_name}: already correct at ${category_balance:,.2f}")
+            print(f"  {cc_name}: already correct at ${payment_amount:,.2f}")
     else:
-        # Create new scheduled payment using historical pay date
-        pay_day = get_cc_payment_history(cc_account_id) or 1
-
-        # Calculate next occurrence of pay_day
-        today = datetime.now().date()
-        if today.day <= pay_day:
-            try:
-                next_pay = today.replace(day=pay_day)
-            except ValueError:
-                # Day doesn't exist in this month, use last day
-                next_pay = today.replace(day=calendar.monthrange(today.year, today.month)[1])
-        else:
-            next_month = _add_months(today, 1)
-            last_day = calendar.monthrange(next_month.year, next_month.month)[1]
-            next_pay = next_month.replace(day=min(pay_day, last_day))
-
-        if DRY_RUN:
-            print(f"  [DRY-RUN] Would create {cc_name}: ${category_balance:,.2f} on {next_pay} (day {pay_day} from history)")
-        else:
-            print(f"  Creating {cc_name}: ${category_balance:,.2f} on {next_pay} (day {pay_day} from history)")
-            ynab_post(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions", {
-                "scheduled_transaction": {
-                    "account_id": checking_account_id,
-                    "date": next_pay.strftime("%Y-%m-%d"),
-                    "amount": amount_milliunits,
-                    "payee_id": None,
-                    "transfer_account_id": cc_account_id,
-                    "memo": "Auto-scheduled by YNAB Monitor",
-                    "frequency": "monthly"
-                }
-            })
+        print(f"  Warning: no scheduled payment found for {cc_name}, skipping")
 
 
 def project_minimum_balance(current_balance, scheduled_transactions, cc_payments, end_date):
@@ -553,13 +556,13 @@ def run_check(send_update=False):
     transactions = get_scheduled_transactions(end_date)
     cc_payments, _ = get_cc_payment_amounts()
 
-    # Ensure CC payments are scheduled correctly
+    # Update CC scheduled payment amounts
     if YNAB_ACCOUNT_IDS:
-        print("\nChecking CC payment schedules...")
+        print("\nChecking CC payment amounts...")
         checking_id = YNAB_ACCOUNT_IDS[0]  # Primary checking account
         for cc_id, payment_info in cc_payments.items():
             if payment_info["amount"] > 0:
-                ensure_cc_payment_scheduled(cc_id, payment_info["name"], payment_info["amount"], checking_id)
+                update_cc_payment_amount(cc_id, payment_info["name"], payment_info["amount"], checking_id)
 
     min_balance, min_date = project_minimum_balance(balance, transactions, cc_payments, end_date)
 
