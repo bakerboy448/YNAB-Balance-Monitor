@@ -355,8 +355,23 @@ def ensure_cc_payment_scheduled(cc_account_id, cc_name, category_balance, checki
                 print(f"  [DRY-RUN] Would update {cc_name}: ${old_dollars:,.2f} -> ${category_balance:,.2f}")
             else:
                 print(f"  Updating {cc_name}: ${old_dollars:,.2f} -> ${category_balance:,.2f}")
+                # YNAB PUT requires date (future, max 1 week past) and account_id.
+                # Use date_next if valid, otherwise use today.
+                today = datetime.now().date()
+                week_ago = today - timedelta(days=7)
+                existing_date_str = existing.get("date_next") or existing.get("date_first", "")
+                if existing_date_str:
+                    existing_date = datetime.strptime(existing_date_str, "%Y-%m-%d").date()
+                else:
+                    existing_date = None
+                if existing_date and existing_date >= week_ago:
+                    valid_date = existing_date
+                else:
+                    valid_date = today
                 ynab_put(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions/{existing['id']}", {
                     "scheduled_transaction": {
+                        "account_id": checking_account_id,
+                        "date": valid_date.strftime("%Y-%m-%d"),
                         "amount": amount_milliunits
                     }
                 })
