@@ -286,11 +286,60 @@ def get_scheduled_transactions(end_date):
     return transactions
 
 
+def _get_last_close_date(close_day):
+    """Return the most recent statement close date for a given close day-of-month."""
+    today = datetime.now().date()
+    # Try this month's close date first
+    try:
+        this_month_close = today.replace(day=close_day)
+    except ValueError:
+        this_month_close = today.replace(day=calendar.monthrange(today.year, today.month)[1])
+    if this_month_close <= today:
+        return this_month_close
+    # Close date hasn't happened yet this month, use last month's
+    last_month = _add_months(today, -1)
+    try:
+        return last_month.replace(day=min(close_day, calendar.monthrange(last_month.year, last_month.month)[1]))
+    except ValueError:
+        return last_month.replace(day=calendar.monthrange(last_month.year, last_month.month)[1])
+
+
+def _compute_statement_balance(account_id, cleared_balance_milliunits, close_day):
+    """Compute the statement balance as of the last close date.
+
+    statement_balance = cleared_balance - (sum of post-close cleared transactions)
+    All arithmetic in milliunits. Returns (dollars, last_close_date).
+
+    CC balances are negative in YNAB (debt). The result is negated so that
+    a $500 debt returns 500.0 as the payment amount. Credit balances (positive
+    cleared_balance) return 0.
+    """
+    last_close = _get_last_close_date(close_day)
+    # Get transactions after the close date (since_date is inclusive, so use day after)
+    day_after_close = last_close + timedelta(days=1)
+    since_str = day_after_close.strftime("%Y-%m-%d")
+    data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts/{account_id}/transactions?since_date={since_str}")
+
+    post_close_sum = 0
+    for txn in data.get("transactions", []):
+        if txn.get("deleted"):
+            continue
+        if txn.get("cleared", "") in ("cleared", "reconciled"):
+            post_close_sum += txn["amount"]
+
+    statement_balance_milliunits = cleared_balance_milliunits - post_close_sum
+    # CC balances are negative (debt); negate to get positive payment amount.
+    # If balance is positive (credit/overpayment), payment is $0.
+    payment_dollars = max(0, -milliunits_to_dollars(statement_balance_milliunits))
+    return payment_dollars, last_close
+
+
 def get_cc_payment_amounts():
     """Get credit card payment amounts.
 
-    For cards with configured close dates in YNAB_CC_CLOSE_DATES: uses the
-    account's cleared_balance (approximates statement balance).
+    For cards with configured close dates in YNAB_CC_CLOSE_DATES: computes
+    the statement balance (balance at the close date) by subtracting
+    post-close transactions from cleared_balance.
     For cards without: falls back to category balance (original behavior).
 
     Returns a dict of {account_id: {name, amount}} and the total.
@@ -300,31 +349,30 @@ def get_cc_payment_amounts():
     # Get all accounts to identify CC accounts and their cleared balances
     accounts_data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts")
     cc_accounts = {}  # name -> id
-    cc_cleared = {}   # id -> {name, cleared_balance}
+    cc_cleared = {}   # id -> {name, cleared_balance_milliunits}
     for acct in accounts_data["accounts"]:
         if acct["type"] == "creditCard" and not acct.get("deleted", False) and not acct.get("closed", False):
             cc_accounts[acct["name"]] = acct["id"]
             cc_cleared[acct["id"]] = {
                 "name": acct["name"],
-                "cleared_balance": milliunits_to_dollars(acct["cleared_balance"]),
+                "cleared_balance_milliunits": acct["cleared_balance"],
             }
 
     cc_payments = {}
 
-    # Cards WITH close dates: use cleared_balance from account
+    # Cards WITH close dates: compute statement balance (balance at close date)
     for card_name, close_day in close_dates.items():
         account_id = cc_accounts.get(card_name)
         if not account_id:
             print(f"  Warning: CC close date configured for '{card_name}' but no matching YNAB account found")
             continue
         info = cc_cleared[account_id]
-        # cleared_balance is negative on CC accounts (money owed), take absolute value
-        amount = abs(info["cleared_balance"])
+        amount, last_close = _compute_statement_balance(account_id, info["cleared_balance_milliunits"], close_day)
         if amount > 0:
             cc_payments[account_id] = {
                 "name": card_name,
                 "amount": amount,
-                "source": "cleared_balance",
+                "source": f"statement ({last_close})",
             }
 
     # Cards WITHOUT close dates: fall back to category balance
