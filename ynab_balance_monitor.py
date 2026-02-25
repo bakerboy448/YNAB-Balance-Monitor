@@ -3,7 +3,9 @@
 
 import calendar
 import os
+import re
 import signal
+import socket
 import sys
 import json
 import time
@@ -37,24 +39,39 @@ TZ = os.environ.get("TZ", "")
 DRY_RUN = os.environ.get("DRY_RUN", "").lower() in ("true", "1", "yes")
 
 YNAB_BASE = "https://api.ynab.com/v1"
+YNAB_API_TIMEOUT = 30  # seconds
 
 # ---------------------------------------------------------------------------
 # YNAB API helpers
 # ---------------------------------------------------------------------------
+
+def _sanitize_error(body, max_length=500):
+    """Remove sensitive data from API error responses before logging."""
+    text = body[:max_length]
+    text = re.sub(r'(Bearer\s+)\S+', r'\1[REDACTED]', text, flags=re.IGNORECASE)
+    text = re.sub(
+        r'(["\']?(?:token|key|secret|password)["\']?\s*[:=]\s*)["\']?\S+',
+        r'\1[REDACTED]', text, flags=re.IGNORECASE,
+    )
+    return text
+
 
 def ynab_get(path):
     """Make an authenticated GET request to the YNAB API."""
     url = f"{YNAB_BASE}{path}"
     req = Request(url, headers={"Authorization": f"Bearer {YNAB_API_TOKEN}"})
     try:
-        with urlopen(req) as resp:
+        with urlopen(req, timeout=YNAB_API_TIMEOUT) as resp:
             return json.loads(resp.read().decode())["data"]
     except HTTPError as e:
         body = e.read().decode()
-        print(f"YNAB API error ({e.code}): {body}", file=sys.stderr)
+        print(f"YNAB API error ({e.code}): {_sanitize_error(body)}", file=sys.stderr)
         sys.exit(1)
     except URLError as e:
         print(f"Network error: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+    except socket.timeout:
+        print(f"Timeout connecting to YNAB API ({YNAB_API_TIMEOUT}s)", file=sys.stderr)
         sys.exit(1)
 
 
@@ -67,11 +84,11 @@ def ynab_put(path, payload):
         "Content-Type": "application/json"
     })
     try:
-        with urlopen(req) as resp:
+        with urlopen(req, timeout=YNAB_API_TIMEOUT) as resp:
             return json.loads(resp.read().decode())["data"]
     except HTTPError as e:
         body = e.read().decode()
-        print(f"YNAB API PUT error ({e.code}): {body}", file=sys.stderr)
+        print(f"YNAB API PUT error ({e.code}): {_sanitize_error(body)}", file=sys.stderr)
         raise
 
 
@@ -84,11 +101,11 @@ def ynab_post(path, payload):
         "Content-Type": "application/json"
     })
     try:
-        with urlopen(req) as resp:
+        with urlopen(req, timeout=YNAB_API_TIMEOUT) as resp:
             return json.loads(resp.read().decode())["data"]
     except HTTPError as e:
         body = e.read().decode()
-        print(f"YNAB API POST error ({e.code}): {body}", file=sys.stderr)
+        print(f"YNAB API POST error ({e.code}): {_sanitize_error(body)}", file=sys.stderr)
         raise
 
 
@@ -747,15 +764,35 @@ def send_update_notification(current_balance, min_balance, min_date, end_date, a
 # Main
 # ---------------------------------------------------------------------------
 
+def _is_valid_uuid(value):
+    """Check if value looks like a UUID or known YNAB alias."""
+    if value in ("last-used",):
+        return True
+    return bool(re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', value, re.IGNORECASE))
+
+
 def validate_config():
-    """Check required configuration is present."""
+    """Check required configuration is present and valid."""
     errors = []
     if not YNAB_API_TOKEN:
         errors.append("YNAB_API_TOKEN is required")
     if not YNAB_ACCOUNT_IDS:
         errors.append("YNAB_ACCOUNT_ID is required (single ID or comma-separated list)")
+    else:
+        for aid in YNAB_ACCOUNT_IDS:
+            if not _is_valid_uuid(aid):
+                errors.append(f"YNAB_ACCOUNT_ID contains invalid UUID: '{aid}'")
+    if not _is_valid_uuid(YNAB_BUDGET_ID):
+        errors.append(f"YNAB_BUDGET_ID must be a valid UUID or 'last-used', got: '{YNAB_BUDGET_ID}'")
     if not APPRISE_URLS:
         errors.append("APPRISE_URLS is required")
+    if MONITOR_DAYS:
+        try:
+            days = int(MONITOR_DAYS)
+            if days < 1 or days > 365:
+                errors.append(f"MONITOR_DAYS must be 1-365, got: {days}")
+        except ValueError:
+            errors.append(f"MONITOR_DAYS must be an integer, got: '{MONITOR_DAYS}'")
     if errors:
         for e in errors:
             print(f"Error: {e}", file=sys.stderr)
@@ -937,4 +974,23 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="YNAB Balance Monitor")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--dry-run", action="store_true",
+                       help="Run once immediately, skip notifications and CC updates")
+    group.add_argument("--daemon", action="store_true",
+                       help="Run on SCHEDULE (default when SCHEDULE env var is set)")
+    args = parser.parse_args()
+
+    if args.dry_run:
+        DRY_RUN = True
+        validate_config()
+        run_check()
+    elif args.daemon or SCHEDULE:
+        main()
+    else:
+        # No schedule, no flags — run once
+        validate_config()
+        run_check()

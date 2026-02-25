@@ -1,28 +1,47 @@
 # YNAB Balance Monitor
 
-Projects the minimum balance of a checking account through the end of the current month based on scheduled transactions and credit card payment obligations from [YNAB](https://www.ynab.com/). Sends an [ntfy](https://ntfy.sh) alert if the balance is projected to drop below a threshold.
+Projects the minimum balance of your checking account(s) over a configurable window based on scheduled transactions and credit card statement balances from [YNAB](https://www.ynab.com/). Sends an [Apprise](https://github.com/caronc/apprise) alert if the balance is projected to drop below a dynamic threshold.
 
 Useful for keeping most of your cash in a high-yield savings account while making sure your checking account stays funded.
 
 ## How it works
 
-1. Fetches the current balance of your checking account
-2. Fetches all scheduled transactions for that account within the monitoring window
-3. Fetches credit card payment category balances (money earmarked to pay CC bills)
-4. Deduplicates — scheduled transfers to CC accounts aren't double-counted
-5. Walks day-by-day to find the **minimum projected balance**
-6. If it drops below your threshold, sends an **alert** notification
-7. On the update schedule (if configured), sends a routine **update** notification with the projected minimum regardless of threshold
+1. Fetches the current cleared balance of your checking account(s) — supports monitoring multiple accounts
+2. Fetches all scheduled transactions for those accounts within the projection window
+3. Computes **statement balances** for each credit card using configured close dates — this is the balance at the last statement close, not the current balance
+4. Searches for existing CC payment transfers **bidirectionally** — YNAB may store the transfer on either the checking or credit card side
+5. Updates scheduled CC payment amounts if they don't match the statement balance
+6. Deduplicates — CC payments with scheduled transfers aren't double-counted as unscheduled
+7. Walks day-by-day to find the **minimum projected balance**
+8. Compares the minimum against **dynamic thresholds** based on trailing average daily expenses
+9. If it drops below the alert threshold, sends a notification
+
+## Statement Balance Computation
+
+For cards with configured close dates (`YNAB_CC_CLOSE_DATES`):
+
+```
+statement_balance = cleared_balance - sum(post_close_cleared_transactions)
+```
+
+The monitor looks at the most recent close date, fetches all cleared transactions after that date, and subtracts them from the current cleared balance. This gives the amount owed on the last statement — what autopay will actually charge.
+
+For cards without close dates, falls back to the YNAB category balance.
+
+## Dynamic Thresholds
+
+Thresholds are computed from trailing 13-month average daily expenses:
+
+- **Alert threshold** = `max(MIN_BALANCE, avg_daily_expenses * YNAB_ALERT_BUFFER_DAYS)` — fires a notification
+- **Target threshold** = `max(MIN_BALANCE, avg_daily_expenses * YNAB_TARGET_BUFFER_DAYS)` — the "comfortable" level
 
 ## Setup
 
 ### 1. Get your YNAB credentials
 
-- Go to [YNAB Account Settings → Developer Settings](https://app.ynab.com/settings/developer)
+- Go to [YNAB Account Settings > Developer Settings](https://app.ynab.com/settings/developer)
 - Create a Personal Access Token
-- Find your account ID:
-  - Visit `https://api.ynab.com/v1/budgets/last-used/accounts?access_token=YOUR_TOKEN` and locate your checking account's `id` or
-  - Choose the account in the sidebar and look at the URL: `https://app.ynab.com/(budget ID)/accounts/(account ID)`  
+- Find your account ID via the API or URL bar in YNAB
 
 ### 2. Configure
 
@@ -39,61 +58,73 @@ cp .env.example .env
 docker compose up -d
 ```
 
-The container runs as a long-lived service and checks on your configured schedule. Use `docker compose logs -f` to see output.
+The container runs as a long-lived service and checks on your configured schedule.
 
-**Run once (no schedule):**
+**Run once (dry run):**
 ```bash
-# Leave SCHEDULE empty or unset
-docker compose run --rm monitor
+docker exec <container> python ynab_balance_monitor.py --dry-run
+```
 
-# Or without Docker:
-python ynab_balance_monitor.py
+**CLI usage:**
+```
+python ynab_balance_monitor.py [--dry-run | --daemon]
+
+  --dry-run   Run once immediately, skip notifications and CC payment updates
+  --daemon    Run on SCHEDULE (default when SCHEDULE env var is set)
 ```
 
 ## Configuration
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `YNAB_API_TOKEN` | Yes | — | YNAB Personal Access Token |
-| `YNAB_ACCOUNT_ID` | Yes | — | ID of the checking account to monitor |
+| `YNAB_API_TOKEN` | Yes | -- | YNAB Personal Access Token |
+| `YNAB_ACCOUNT_ID` | Yes | -- | Checking account ID(s) to monitor, comma-separated for multiple |
 | `YNAB_BUDGET_ID` | No | `last-used` | Budget ID (or `last-used`) |
-| `YNAB_CC_CATEGORIES` | No | all | Comma-separated category IDs or names to monitor |
-| `MONITOR_DAYS` | No | end of month | Number of days to project forward (leave empty for end of current month) |
-| `MIN_BALANCE` | No | `0` | Minimum threshold floor in dollars (serves as floor for dynamic thresholds) |
-| `YNAB_TARGET_BUFFER_DAYS` | No | `10` | Target buffer — days of average daily expenses the projected minimum should cover |
-| `YNAB_ALERT_BUFFER_DAYS` | No | `5` | Alert buffer — fire alert if projected minimum covers fewer than this many days |
-| `SCHEDULE` | No | — | `HH:MM` for daily at that time, or `Nh` for every N hours. Empty = run once and exit |
-| `UPDATE_SCHEDULE` | No | — | Same format as `SCHEDULE`. When set, sends a routine balance update notification on this cadence, independent of `SCHEDULE` |
-| `APPRISE_URLS` | Yes | — | Comma-separated [Apprise URLs](https://github.com/caronc/apprise/wiki) for alert notifications |
-| `UPDATE_APPRISE_URLS` | No | `APPRISE_URLS` | Comma-separated Apprise URLs for update notifications. Useful for routing updates to a lower-priority channel |
-| `TZ` | No | `UTC` | Timezone for daily schedule (e.g. `America/New_York`) |
+| `YNAB_CC_CLOSE_DATES` | No | -- | Statement close dates as `CardName:DayOfMonth` pairs, comma-separated |
+| `YNAB_CC_CREATE_PAYMENTS` | No | `false` | Auto-create scheduled CC payment transfers if none exist |
+| `YNAB_CC_CATEGORIES` | No | all | Comma-separated category IDs or names to include |
+| `MONITOR_DAYS` | No | end of month | Number of days to project forward |
+| `MIN_BALANCE` | No | `0` | Minimum threshold floor in dollars |
+| `YNAB_ALERT_BUFFER_DAYS` | No | `5` | Alert if projected minimum covers fewer than this many days of expenses |
+| `YNAB_TARGET_BUFFER_DAYS` | No | `10` | Target buffer in days of expenses for "comfortable" level |
+| `SCHEDULE` | No | -- | `HH:MM` for daily, `Nh` for interval. Empty = run once |
+| `UPDATE_SCHEDULE` | No | -- | Separate schedule for routine balance update notifications |
+| `APPRISE_URLS` | Yes | -- | Comma-separated [Apprise URLs](https://github.com/caronc/apprise/wiki) for alerts |
+| `UPDATE_APPRISE_URLS` | No | `APPRISE_URLS` | Separate Apprise URLs for routine updates |
+| `TZ` | No | `UTC` | Timezone for schedule (e.g. `America/Chicago`) |
+| `DRY_RUN` | No | `false` | Skip notifications and CC updates (env var equivalent of `--dry-run`) |
 
 ## Example output
 
 ```
 ============================================================
-YNAB Balance Monitor — 2026-02-07 08:00
-Projecting through 2026-02-28, min floor: $500.00
+YNAB Balance Monitor -- 2026-02-24 19:13
+Projecting through 2026-04-25, min floor: $500.00
 ============================================================
-Account: Primary Checking
-Current balance: $2,450.00
+Account: DG Checking 3969
+  Balance: $11,686.73
+Account: Ally Checking 9958
+  Balance: $1,918.52
+Combined balance: $13,605.25
 
-Scheduled transactions through 2026-02-28: 3
-  2026-02-10  Rent                            $ -1,500.00
-  2026-02-14  Paycheck                        $  3,200.00
-  2026-02-28  Car Payment                     $   -450.00
+Scheduled transactions through 2026-04-25: 28
+  2026-02-26  Turnberry Manor Condo Association (monthly)  $   -274.95
+  2026-02-27  Transfer : Chase Unlimited 9765 (monthly)    $ -2,902.05
+  2026-02-28  CIBC Bank USA (monthly)                      $  3,568.01
+  ...
 
-Credit card payments to account for: $1,200.00
-  Chase Sapphire                              $    800.00
-  Amex Gold                                   $    400.00
+Credit card payments to account for: $10,217.30
+  Chase Freedom 9177              $  1,788.03 (statement (2026-01-25))
+  Discover 9356                   $      7.99 (statement (2026-02-09))
+  Chase Unlimited 9765            $  2,902.05 (statement (2026-02-02))
+  ...
 
-Trailing 13-month expenses: $38,400.00 (avg $2,953.85/mo, $97.03/day)
-Alert threshold (5 days): $500.00
-Target threshold (10 days): $1,000.00
+Trailing 13-month expenses:
+     Average  $ 11,115.60/mo  ($365.16/day)
+Alert threshold (15d): $5,500
+Target threshold (30d): $11,000
 
-Unscheduled CC payments (applied today): $1,200.00
+All CC payments are scheduled.
 
-Projected minimum balance: $950.00 on 2026-02-10
-
-✓ On track (950.00 ≥ alert threshold of 500.00)
+Projected minimum balance: $4,930.03 on 2026-04-22
 ```
