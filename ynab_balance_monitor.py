@@ -256,16 +256,27 @@ def get_scheduled_transactions(end_date):
 
     transactions = []
     for txn in data["scheduled_transactions"]:
-        if txn["account_id"] not in YNAB_ACCOUNT_IDS:
-            continue
         if txn.get("deleted", False):
+            continue
+
+        acct_id = txn["account_id"]
+        xfer_id = txn.get("transfer_account_id")
+
+        # Include transactions ON a monitored account, OR transfers TO a
+        # monitored account (stored on the other side, e.g. CC -> checking)
+        on_checking = acct_id in YNAB_ACCOUNT_IDS
+        xfer_to_checking = xfer_id in YNAB_ACCOUNT_IDS
+        if not on_checking and not xfer_to_checking:
             continue
 
         next_date = datetime.strptime(txn.get("date_next") or txn.get("date_first", ""), "%Y-%m-%d").date()
         frequency = txn.get("frequency", "never")
-        amount = milliunits_to_dollars(txn["amount"])
+        # If stored on the CC side (transfer to checking), flip the sign
+        # so it appears as an outflow from checking's perspective
+        raw_amount = milliunits_to_dollars(txn["amount"])
+        amount = -raw_amount if xfer_to_checking and not on_checking else raw_amount
         payee = txn.get("payee_name", "Unknown")
-        transfer_account_id = txn.get("transfer_account_id")
+        transfer_account_id = xfer_id if on_checking else acct_id
 
         occurrences = _expand_occurrences(next_date, frequency, today, end_date)
         for occ_date in occurrences:
