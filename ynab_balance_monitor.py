@@ -446,22 +446,30 @@ def update_cc_payment_amount(cc_account_id, cc_name, payment_amount, checking_ac
     data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions")
 
     existing = None
+    reverse = False
     for txn in data["scheduled_transactions"]:
         if txn.get("deleted"):
             continue
-        # Find transfer from checking to this CC
+        # Find transfer between checking and this CC (either direction)
         if (txn["account_id"] == checking_account_id and
             txn.get("transfer_account_id") == cc_account_id):
             existing = txn
             break
+        if (txn["account_id"] == cc_account_id and
+            txn.get("transfer_account_id") == checking_account_id):
+            existing = txn
+            reverse = True
+            break
 
-    # Amount in milliunits, negative = outflow from checking
-    amount_milliunits = int(payment_amount * -1000)
+    # Amount in milliunits — sign depends on which account holds the record
+    # Checking side: negative (outflow). CC side: positive (inflow).
+    amount_milliunits = int(payment_amount * (1000 if reverse else -1000))
 
     if existing:
         current_amount = existing["amount"]
         if current_amount != amount_milliunits:
-            old_dollars = current_amount / -1000
+            # Display as positive dollars regardless of sign direction
+            old_dollars = abs(current_amount / 1000)
             if DRY_RUN:
                 print(f"  [DRY-RUN] Would update {cc_name}: ${old_dollars:,.2f} -> ${payment_amount:,.2f}")
             else:
@@ -481,7 +489,7 @@ def update_cc_payment_amount(cc_account_id, cc_name, payment_amount, checking_ac
                     valid_date = today
                 ynab_put(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions/{existing['id']}", {
                     "scheduled_transaction": {
-                        "account_id": checking_account_id,
+                        "account_id": existing["account_id"],
                         "date": valid_date.strftime("%Y-%m-%d"),
                         "amount": amount_milliunits
                     }
