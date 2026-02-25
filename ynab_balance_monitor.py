@@ -533,33 +533,55 @@ def update_cc_payment_amount(cc_account_id, cc_name, payment_amount, checking_ac
             print(f"  Warning: no scheduled payment found for {cc_name}, skipping")
 
 
+def _get_all_cc_transfer_ids():
+    """Fetch all scheduled CC transfer account IDs (regardless of date).
+
+    Returns a set of CC account IDs that have a scheduled transfer
+    from/to any monitored checking account.
+    """
+    data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions")
+    covered = set()
+    for txn in data["scheduled_transactions"]:
+        if txn.get("deleted"):
+            continue
+        acct = txn["account_id"]
+        xfer = txn.get("transfer_account_id")
+        if not xfer:
+            continue
+        # Transfer from checking to CC
+        if acct in YNAB_ACCOUNT_IDS:
+            covered.add(xfer)
+        # Transfer from CC to checking (stored on CC side)
+        if xfer in YNAB_ACCOUNT_IDS:
+            covered.add(acct)
+    return covered
+
+
 def project_minimum_balance(current_balance, scheduled_transactions, cc_payments, end_date):
     """Walk day-by-day to find the minimum projected balance.
 
-    CC payments that are already in scheduled_transactions (as transfers to CC
-    accounts) are not double-counted. Any remaining CC payment amounts are
-    applied on day 1 (conservative: assumes they could hit at any time).
+    CC payments with scheduled transfers (even beyond the projection window)
+    are excluded from the day-1 lump sum. Only truly unscheduled CC payments
+    are applied on day 1 as a conservative estimate.
     """
     today = datetime.now().date()
 
-    # Identify which CC payments are already covered by scheduled transfers
-    remaining_cc = dict(cc_payments)  # shallow copy of outer dict
-    for txn in scheduled_transactions:
-        transfer_id = txn["transfer_account_id"]
-        if transfer_id and transfer_id in remaining_cc:
-            # This scheduled transaction already covers (part of) the CC payment
-            covered = min(remaining_cc[transfer_id]["amount"], abs(txn["amount"]))
-            remaining_cc[transfer_id] = {
-                **remaining_cc[transfer_id],
-                "amount": remaining_cc[transfer_id]["amount"] - covered,
-            }
-            if remaining_cc[transfer_id]["amount"] <= 0.005:
-                del remaining_cc[transfer_id]
+    # Identify CC accounts that have ANY scheduled transfer (regardless of date)
+    covered_cc_ids = _get_all_cc_transfer_ids()
+
+    # Remove covered CC payments; also dedup against in-window transfers
+    remaining_cc = {}
+    for cc_id, info in cc_payments.items():
+        if cc_id in covered_cc_ids:
+            continue  # Has a scheduled transfer — will be handled when it hits
+        remaining_cc[cc_id] = info
 
     # Unscheduled CC payment total — apply on day 1
     unscheduled_cc_total = sum(p["amount"] for p in remaining_cc.values())
     if unscheduled_cc_total > 0:
         print(f"\nUnscheduled CC payments (applied today): ${unscheduled_cc_total:,.2f}")
+    else:
+        print(f"\nAll CC payments are scheduled.")
 
     # Build day-by-day projection
     balance = current_balance - unscheduled_cc_total
