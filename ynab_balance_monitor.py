@@ -2,16 +2,15 @@
 """YNAB Balance Monitor - Projects minimum checking account balance and alerts via Apprise."""
 
 import calendar
+import json
 import os
 import re
 import signal
-import socket
 import sys
-import json
 import time
-from datetime import datetime, timedelta, date
-from urllib.request import Request, urlopen
+from datetime import date, datetime, timedelta
 from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import apprise
 
@@ -74,7 +73,7 @@ def ynab_get(path):
     except URLError as e:
         print(f"Network error: {e.reason}", file=sys.stderr)
         sys.exit(1)
-    except socket.timeout:
+    except TimeoutError:
         print(f"Timeout connecting to YNAB API ({YNAB_API_TIMEOUT}s)", file=sys.stderr)
         sys.exit(1)
 
@@ -513,14 +512,8 @@ def update_cc_payment_amount(cc_account_id, cc_name, payment_amount, checking_ac
                 today = datetime.now().date()
                 week_ago = today - timedelta(days=7)
                 existing_date_str = existing.get("date_next") or existing.get("date_first", "")
-                if existing_date_str:
-                    existing_date = datetime.strptime(existing_date_str, "%Y-%m-%d").date()
-                else:
-                    existing_date = None
-                if existing_date and existing_date >= week_ago:
-                    valid_date = existing_date
-                else:
-                    valid_date = today
+                existing_date = datetime.strptime(existing_date_str, "%Y-%m-%d").date() if existing_date_str else None
+                valid_date = existing_date if existing_date and existing_date >= week_ago else today
                 ynab_put(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions/{existing['id']}", {
                     "scheduled_transaction": {
                         "account_id": existing["account_id"],
@@ -534,7 +527,10 @@ def update_cc_payment_amount(cc_account_id, cc_name, payment_amount, checking_ac
         if YNAB_CC_CREATE_PAYMENTS:
             pay_day = get_cc_payment_history(cc_account_id)
             if pay_day is None:
-                print(f"  Warning: no payment history found for {cc_name}, cannot determine pay date — skipping creation")
+                print(
+                    f"  Warning: no payment history found for {cc_name},"
+                    " cannot determine pay date — skipping creation"
+                )
             else:
                 # Calculate next occurrence of pay_day
                 today = datetime.now().date()
@@ -549,7 +545,10 @@ def update_cc_payment_amount(cc_account_id, cc_name, payment_amount, checking_ac
                     next_pay = next_month.replace(day=min(pay_day, last_day))
 
                 if DRY_RUN:
-                    print(f"  [DRY-RUN] Would create {cc_name}: ${payment_amount:,.2f} on {next_pay} (day {pay_day} from history)")
+                    print(
+                        f"  [DRY-RUN] Would create {cc_name}:"
+                        f" ${payment_amount:,.2f} on {next_pay} (day {pay_day} from history)"
+                    )
                 else:
                     print(f"  Creating {cc_name}: ${payment_amount:,.2f} on {next_pay} (day {pay_day} from history)")
                     ynab_post(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions", {
@@ -615,7 +614,7 @@ def project_minimum_balance(current_balance, scheduled_transactions, cc_payments
     if unscheduled_cc_total > 0:
         print(f"\nUnscheduled CC payments (applied today): ${unscheduled_cc_total:,.2f}")
     else:
-        print(f"\nAll CC payments are scheduled.")
+        print("\nAll CC payments are scheduled.")
 
     # Build day-by-day projection
     balance = current_balance - unscheduled_cc_total
@@ -677,7 +676,7 @@ def calculate_monthly_expenses():
     avg_monthly = sum(t for _, t in monthly_totals) / len(monthly_totals)
     avg_daily = avg_monthly / 30.44  # average days per month
 
-    print(f"\nTrailing 13-month expenses:")
+    print("\nTrailing 13-month expenses:")
     for month_start, total in monthly_totals:
         print(f"  {month_start.strftime('%b %Y'):>10s}  ${total:>10,.2f}")
     print(f"  {'Average':>10s}  ${avg_monthly:>10,.2f}/mo  (${avg_daily:,.2f}/day)")
