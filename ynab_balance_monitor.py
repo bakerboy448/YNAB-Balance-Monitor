@@ -48,13 +48,16 @@ USER_AGENT = f"YNAB-Balance-Monitor/{APP_VERSION} (+https://github.com/bakerboy4
 # YNAB API helpers
 # ---------------------------------------------------------------------------
 
+
 def _sanitize_error(body, max_length=500):
     """Remove sensitive data from API error responses before logging."""
     text = body[:max_length]
-    text = re.sub(r'(Bearer\s+)\S+', r'\1[REDACTED]', text, flags=re.IGNORECASE)
+    text = re.sub(r"(Bearer\s+)\S+", r"\1[REDACTED]", text, flags=re.IGNORECASE)
     text = re.sub(
         r'(["\']?(?:token|key|secret|password)["\']?\s*[:=]\s*)["\']?\S+',
-        r'\1[REDACTED]', text, flags=re.IGNORECASE,
+        r"\1[REDACTED]",
+        text,
+        flags=re.IGNORECASE,
     )
     return text
 
@@ -82,11 +85,16 @@ def ynab_put(path, payload):
     """Make an authenticated PUT request to the YNAB API."""
     url = f"{YNAB_BASE}{path}"
     data = json.dumps(payload).encode()
-    req = Request(url, data=data, method="PUT", headers={
-        "Authorization": f"Bearer {YNAB_API_TOKEN}",
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-    })
+    req = Request(
+        url,
+        data=data,
+        method="PUT",
+        headers={
+            "Authorization": f"Bearer {YNAB_API_TOKEN}",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+    )
     try:
         with urlopen(req, timeout=YNAB_API_TIMEOUT) as resp:
             return json.loads(resp.read().decode())["data"]
@@ -100,11 +108,16 @@ def ynab_post(path, payload):
     """Make an authenticated POST request to the YNAB API."""
     url = f"{YNAB_BASE}{path}"
     data = json.dumps(payload).encode()
-    req = Request(url, data=data, method="POST", headers={
-        "Authorization": f"Bearer {YNAB_API_TOKEN}",
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-    })
+    req = Request(
+        url,
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {YNAB_API_TOKEN}",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+    )
     try:
         with urlopen(req, timeout=YNAB_API_TIMEOUT) as resp:
             return json.loads(resp.read().decode())["data"]
@@ -154,6 +167,7 @@ def parse_cc_close_dates():
 # Core logic
 # ---------------------------------------------------------------------------
 
+
 def get_end_date():
     """Compute the projection end date.
 
@@ -180,11 +194,13 @@ def get_account_balances():
         data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts/{account_id}")
         account = data["account"]
         balance = milliunits_to_dollars(account["balance"])
-        accounts.append({
-            "id": account_id,
-            "name": account["name"],
-            "balance": balance,
-        })
+        accounts.append(
+            {
+                "id": account_id,
+                "name": account["name"],
+                "balance": balance,
+            }
+        )
         total_balance += balance
         print(f"Account: {account['name']}")
         print(f"  Balance: ${balance:,.2f}")
@@ -214,17 +230,17 @@ def _expand_occurrences(next_date, frequency, start, end):
     # Map YNAB frequency to a delta-generating function.
     # Each function returns the next date given the current one.
     DELTAS = {
-        "daily":          lambda d: d + timedelta(days=1),
-        "weekly":         lambda d: d + timedelta(weeks=1),
+        "daily": lambda d: d + timedelta(days=1),
+        "weekly": lambda d: d + timedelta(weeks=1),
         "everyOtherWeek": lambda d: d + timedelta(weeks=2),
-        "every4Weeks":    lambda d: d + timedelta(weeks=4),
-        "monthly":        lambda d: _add_months(d, 1),
-        "everyOtherMonth":lambda d: _add_months(d, 2),
-        "every3Months":   lambda d: _add_months(d, 3),
-        "every4Months":   lambda d: _add_months(d, 4),
-        "twiceAMonth":    None,  # special case
-        "twiceAYear":     lambda d: _add_months(d, 6),
-        "yearly":         lambda d: _add_months(d, 12),
+        "every4Weeks": lambda d: d + timedelta(weeks=4),
+        "monthly": lambda d: _add_months(d, 1),
+        "everyOtherMonth": lambda d: _add_months(d, 2),
+        "every3Months": lambda d: _add_months(d, 3),
+        "every4Months": lambda d: _add_months(d, 4),
+        "twiceAMonth": None,  # special case
+        "twiceAYear": lambda d: _add_months(d, 6),
+        "yearly": lambda d: _add_months(d, 12),
         "everyOtherYear": lambda d: _add_months(d, 24),
     }
 
@@ -303,14 +319,16 @@ def get_scheduled_transactions(end_date):
         occurrences = _expand_occurrences(next_date, frequency, today, end_date)
         for occ_date in occurrences:
             freq_label = f" ({frequency})" if frequency != "never" else ""
-            transactions.append({
-                "date": occ_date,
-                "amount": amount,
-                "payee": payee,
-                "transfer_account_id": transfer_account_id,
-                "frequency": frequency,
-                "label": f"{payee}{freq_label}",
-            })
+            transactions.append(
+                {
+                    "date": occ_date,
+                    "amount": amount,
+                    "payee": payee,
+                    "transfer_account_id": transfer_account_id,
+                    "frequency": frequency,
+                    "label": f"{payee}{freq_label}",
+                }
+            )
 
     transactions.sort(key=lambda t: t["date"])
     print(f"\nScheduled transactions through {end_date}: {len(transactions)}")
@@ -382,7 +400,7 @@ def get_cc_payment_amounts():
     # Get all accounts to identify CC accounts and their cleared balances
     accounts_data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts")
     cc_accounts = {}  # name -> id
-    cc_cleared = {}   # id -> {name, cleared_balance_milliunits}
+    cc_cleared = {}  # id -> {name, cleared_balance_milliunits}
     for acct in accounts_data["accounts"]:
         if acct["type"] == "creditCard" and not acct.get("deleted", False) and not acct.get("closed", False):
             cc_accounts[acct["name"]] = acct["id"]
@@ -484,12 +502,10 @@ def update_cc_payment_amount(cc_account_id, cc_name, payment_amount, checking_ac
         if txn.get("deleted"):
             continue
         # Find transfer between checking and this CC (either direction)
-        if (txn["account_id"] == checking_account_id and
-            txn.get("transfer_account_id") == cc_account_id):
+        if txn["account_id"] == checking_account_id and txn.get("transfer_account_id") == cc_account_id:
             existing = txn
             break
-        if (txn["account_id"] == cc_account_id and
-            txn.get("transfer_account_id") == checking_account_id):
+        if txn["account_id"] == cc_account_id and txn.get("transfer_account_id") == checking_account_id:
             existing = txn
             reverse = True
             break
@@ -514,13 +530,16 @@ def update_cc_payment_amount(cc_account_id, cc_name, payment_amount, checking_ac
                 existing_date_str = existing.get("date_next") or existing.get("date_first", "")
                 existing_date = datetime.strptime(existing_date_str, "%Y-%m-%d").date() if existing_date_str else None
                 valid_date = existing_date if existing_date and existing_date >= week_ago else today
-                ynab_put(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions/{existing['id']}", {
-                    "scheduled_transaction": {
-                        "account_id": existing["account_id"],
-                        "date": valid_date.strftime("%Y-%m-%d"),
-                        "amount": amount_milliunits
-                    }
-                })
+                ynab_put(
+                    f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions/{existing['id']}",
+                    {
+                        "scheduled_transaction": {
+                            "account_id": existing["account_id"],
+                            "date": valid_date.strftime("%Y-%m-%d"),
+                            "amount": amount_milliunits,
+                        }
+                    },
+                )
         else:
             print(f"  {cc_name}: already correct at ${payment_amount:,.2f}")
     else:
@@ -528,8 +547,7 @@ def update_cc_payment_amount(cc_account_id, cc_name, payment_amount, checking_ac
             pay_day = get_cc_payment_history(cc_account_id)
             if pay_day is None:
                 print(
-                    f"  Warning: no payment history found for {cc_name},"
-                    " cannot determine pay date — skipping creation"
+                    f"  Warning: no payment history found for {cc_name}, cannot determine pay date — skipping creation"
                 )
             else:
                 # Calculate next occurrence of pay_day
@@ -551,17 +569,20 @@ def update_cc_payment_amount(cc_account_id, cc_name, payment_amount, checking_ac
                     )
                 else:
                     print(f"  Creating {cc_name}: ${payment_amount:,.2f} on {next_pay} (day {pay_day} from history)")
-                    ynab_post(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions", {
-                        "scheduled_transaction": {
-                            "account_id": checking_account_id,
-                            "date": next_pay.strftime("%Y-%m-%d"),
-                            "amount": amount_milliunits,
-                            "payee_id": None,
-                            "transfer_account_id": cc_account_id,
-                            "memo": "Auto-scheduled by YNAB Monitor",
-                            "frequency": "monthly"
-                        }
-                    })
+                    ynab_post(
+                        f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions",
+                        {
+                            "scheduled_transaction": {
+                                "account_id": checking_account_id,
+                                "date": next_pay.strftime("%Y-%m-%d"),
+                                "amount": amount_milliunits,
+                                "payee_id": None,
+                                "transfer_account_id": cc_account_id,
+                                "memo": "Auto-scheduled by YNAB Monitor",
+                                "frequency": "monthly",
+                            }
+                        },
+                    )
         else:
             print(f"  Warning: no scheduled payment found for {cc_name}, skipping")
 
@@ -706,6 +727,7 @@ def get_dynamic_thresholds(avg_daily_expenses):
 # Notification
 # ---------------------------------------------------------------------------
 
+
 def _build_notifier(urls_str):
     """Build an Apprise notifier from a comma-separated URL string."""
     notifier = apprise.Apprise()
@@ -769,11 +791,12 @@ def send_update_notification(current_balance, min_balance, min_date, end_date, a
 # Main
 # ---------------------------------------------------------------------------
 
+
 def _is_valid_uuid(value):
     """Check if value looks like a UUID or known YNAB alias."""
     if value in ("last-used",):
         return True
-    return bool(re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', value, re.IGNORECASE))
+    return bool(re.match(r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$", value, re.IGNORECASE))
 
 
 def validate_config():
@@ -852,6 +875,7 @@ def run_check(send_update=False):
 # ---------------------------------------------------------------------------
 # Scheduling
 # ---------------------------------------------------------------------------
+
 
 def _parse_schedule(schedule):
     """Parse a schedule string into a descriptor tuple.
@@ -983,10 +1007,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="YNAB Balance Monitor")
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--dry-run", action="store_true",
-                       help="Run once immediately, skip notifications and CC updates")
-    group.add_argument("--daemon", action="store_true",
-                       help="Run on SCHEDULE (default when SCHEDULE env var is set)")
+    group.add_argument("--dry-run", action="store_true", help="Run once immediately, skip notifications and CC updates")
+    group.add_argument("--daemon", action="store_true", help="Run on SCHEDULE (default when SCHEDULE env var is set)")
     args = parser.parse_args()
 
     if args.dry_run:
