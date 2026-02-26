@@ -41,6 +41,10 @@ DRY_RUN = os.environ.get("DRY_RUN", "").lower() in ("true", "1", "yes")
 YNAB_BASE = "https://api.ynab.com/v1"
 YNAB_API_TIMEOUT = 30  # seconds
 
+APP_NAME = "YNAB Monitor"
+APP_VERSION = "1.1.0"
+USER_AGENT = f"YNAB-Balance-Monitor/{APP_VERSION} (+https://github.com/bakerboy448/YNAB-Balance-Monitor)"
+
 # ---------------------------------------------------------------------------
 # YNAB API helpers
 # ---------------------------------------------------------------------------
@@ -59,7 +63,7 @@ def _sanitize_error(body, max_length=500):
 def ynab_get(path):
     """Make an authenticated GET request to the YNAB API."""
     url = f"{YNAB_BASE}{path}"
-    req = Request(url, headers={"Authorization": f"Bearer {YNAB_API_TOKEN}"})
+    req = Request(url, headers={"Authorization": f"Bearer {YNAB_API_TOKEN}", "User-Agent": USER_AGENT})
     try:
         with urlopen(req, timeout=YNAB_API_TIMEOUT) as resp:
             return json.loads(resp.read().decode())["data"]
@@ -81,7 +85,8 @@ def ynab_put(path, payload):
     data = json.dumps(payload).encode()
     req = Request(url, data=data, method="PUT", headers={
         "Authorization": f"Bearer {YNAB_API_TOKEN}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
     })
     try:
         with urlopen(req, timeout=YNAB_API_TIMEOUT) as resp:
@@ -98,7 +103,8 @@ def ynab_post(path, payload):
     data = json.dumps(payload).encode()
     req = Request(url, data=data, method="POST", headers={
         "Authorization": f"Bearer {YNAB_API_TOKEN}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
     })
     try:
         with urlopen(req, timeout=YNAB_API_TIMEOUT) as resp:
@@ -714,7 +720,7 @@ def _build_notifier(urls_str):
 def send_alert_notification(current_balance, min_balance, min_date, alert_threshold, target_threshold):
     """Send a below-threshold alert via Apprise."""
     shortfall = alert_threshold - min_balance
-    title = f"Transfer ${shortfall:,.0f} to checking"
+    title = f"{APP_NAME}: Transfer ${shortfall:,.0f} to checking"
     message = (
         f"Projected minimum ${min_balance:,.0f} on {min_date.strftime('%b %d')} "
         f"is ${shortfall:,.0f} below the ${alert_threshold:,.0f} alert threshold.\n"
@@ -736,13 +742,13 @@ def send_update_notification(current_balance, min_balance, min_date, end_date, a
     """Send a routine projected-balance update via Apprise."""
     if min_balance < alert_threshold:
         status = "BELOW ALERT"
-        title = f"Checking: ${min_balance:,.0f} min — {status}"
+        title = f"{APP_NAME}: Checking ${min_balance:,.0f} min — {status}"
     elif min_balance < target_threshold:
         status = "below target"
-        title = f"Checking: ${min_balance:,.0f} min — {status}"
+        title = f"{APP_NAME}: Checking ${min_balance:,.0f} min — {status}"
     else:
         status = "on track"
-        title = f"Checking: ${min_balance:,.0f} min — {status}"
+        title = f"{APP_NAME}: Checking ${min_balance:,.0f} min — {status}"
     message = (
         f"Current: ${current_balance:,.0f} | "
         f"Min: ${min_balance:,.0f} on {min_date.strftime('%b %d')}\n"
