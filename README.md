@@ -1,5 +1,8 @@
 # YNAB Balance Monitor
 
+[![CI](https://github.com/bakerboy448/YNAB-Balance-Monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/bakerboy448/YNAB-Balance-Monitor/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 Projects the minimum balance of your checking account(s) over a configurable window based on scheduled transactions and credit card statement balances from [YNAB](https://www.ynab.com/). Sends an [Apprise](https://github.com/caronc/apprise) alert if the balance is projected to drop below a dynamic threshold.
 
 Useful for keeping most of your cash in a high-yield savings account while making sure your checking account stays funded.
