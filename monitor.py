@@ -518,8 +518,9 @@ def main():
         do_update = next_update is not None and now >= next_update
 
         # Run the projection (always checks alert threshold; optionally sends
-        # an update notification when the update schedule fires).
-        run_check(send_update=do_update)
+        # an update notification when the update schedule fires, or on every
+        # check when no separate UPDATE_SCHEDULE is configured).
+        run_check(send_update=do_update or (do_check and update_schedule is None))
 
         if do_check and schedule:
             next_check = _next_occurrence(schedule)
