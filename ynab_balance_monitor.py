@@ -751,7 +751,7 @@ def _send_notifiarr(payload):
 
     Returns True on success, False on failure.
     """
-    url = f"https://notifiarr.com/api/v1/notification/passthrough/{NOTIFIARR_API_KEY}"
+    url = "https://notifiarr.com/api/v1/notification/passthrough"
     data = json.dumps(payload).encode()
     req = Request(
         url,
@@ -761,6 +761,7 @@ def _send_notifiarr(payload):
             "Content-Type": "application/json",
             "Accept": "text/plain",
             "User-Agent": USER_AGENT,
+            "x-api-key": NOTIFIARR_API_KEY,
         },
     )
     if DRY_RUN:
