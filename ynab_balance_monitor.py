@@ -34,6 +34,9 @@ APPRISE_URLS = os.environ.get("APPRISE_URLS", "")  # comma-separated Apprise URL
 SCHEDULE = os.environ.get("SCHEDULE", "")  # e.g. "08:00" for daily at 8am, "6h" for every 6 hours
 UPDATE_SCHEDULE = os.environ.get("UPDATE_SCHEDULE", "")  # when to send routine balance update notifications
 UPDATE_APPRISE_URLS = os.environ.get("UPDATE_APPRISE_URLS", "")  # defaults to APPRISE_URLS if empty
+NOTIFIARR_API_KEY = os.environ.get("NOTIFIARR_API_KEY", "")
+NOTIFIARR_CHANNEL_ID = os.environ.get("NOTIFIARR_CHANNEL_ID", "")  # Discord channel ID
+NOTIFIARR_UPDATE_CHANNEL_ID = os.environ.get("NOTIFIARR_UPDATE_CHANNEL_ID", "")  # defaults to NOTIFIARR_CHANNEL_ID
 TZ = os.environ.get("TZ", "")
 DRY_RUN = os.environ.get("DRY_RUN", "").lower() in ("true", "1", "yes")
 
@@ -738,19 +741,247 @@ def _build_notifier(urls_str):
     return notifier
 
 
-def send_alert_notification(current_balance, min_balance, min_date, alert_threshold, target_threshold):
-    """Send a below-threshold alert via Apprise."""
-    shortfall = alert_threshold - min_balance
-    title = f"{APP_NAME}: Transfer ${shortfall:,.0f} to checking"
-    message = (
-        f"Projected minimum ${min_balance:,.0f} on {min_date.strftime('%b %d')} "
-        f"is ${shortfall:,.0f} below the ${alert_threshold:,.0f} alert threshold.\n"
-        f"Current balance: ${current_balance:,.0f}\n"
-        f"Target: ${target_threshold:,.0f}"
+def _notifiarr_configured():
+    """Check if Notifiarr passthrough is configured."""
+    return bool(NOTIFIARR_API_KEY and NOTIFIARR_CHANNEL_ID)
+
+
+def _send_notifiarr(payload):
+    """POST a JSON payload to the Notifiarr passthrough API.
+
+    Returns True on success, False on failure.
+    """
+    url = f"https://notifiarr.com/api/v1/notification/passthrough/{NOTIFIARR_API_KEY}"
+    data = json.dumps(payload).encode()
+    req = Request(
+        url,
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "text/plain",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    if DRY_RUN:
+        print("\n[DRY-RUN] Notifiarr payload:")
+        print(json.dumps(payload, indent=2))
+        return True
+    try:
+        with urlopen(req, timeout=YNAB_API_TIMEOUT) as resp:
+            body = resp.read().decode()
+            result = json.loads(body)
+            if result.get("result") == "success":
+                print("Notifiarr passthrough sent successfully")
+                return True
+            print(f"Notifiarr passthrough unexpected response: {body[:200]}", file=sys.stderr)
+            return False
+    except HTTPError as e:
+        body = e.read().decode()
+        print(f"Notifiarr API error ({e.code}): {_sanitize_error(body)}", file=sys.stderr)
+        return False
+    except (URLError, TimeoutError) as e:
+        print(f"Notifiarr network error: {e}", file=sys.stderr)
+        return False
+
+
+def _build_notification_context(
+    balance,
+    accounts,
+    min_balance,
+    min_date,
+    end_date,
+    alert_threshold,
+    target_threshold,
+    avg_daily,
+    transactions,
+    cc_payments,
+):
+    """Collect all notification data into a single context dict."""
+    shortfall = max(0, alert_threshold - min_balance)
+    transfer_to_target = max(0, target_threshold - min_balance)
+    buffer_days = min_balance / avg_daily if avg_daily > 0 else 0
+
+    # Top 5 largest outflows in next 7 days
+    today = datetime.now().date()
+    week_out = today + timedelta(days=7)
+    upcoming = sorted(
+        [t for t in transactions if today <= t["date"] <= week_out and t["amount"] < 0],
+        key=lambda t: t["amount"],
+    )[:5]
+
+    return {
+        "current_balance": balance,
+        "accounts": accounts,
+        "min_balance": min_balance,
+        "min_date": min_date,
+        "end_date": end_date,
+        "alert_threshold": alert_threshold,
+        "target_threshold": target_threshold,
+        "alert_buffer_days": YNAB_ALERT_BUFFER_DAYS,
+        "target_buffer_days": YNAB_TARGET_BUFFER_DAYS,
+        "avg_daily_expenses": avg_daily,
+        "buffer_days_remaining": buffer_days,
+        "shortfall": shortfall,
+        "transfer_to_target": transfer_to_target,
+        "upcoming_outflows": upcoming,
+        "cc_payments": cc_payments,
+    }
+
+
+def _fmt_dollars(amount):
+    """Format a dollar amount with sign for negative values."""
+    if amount < 0:
+        return f"-${abs(amount):,.0f}"
+    return f"${amount:,.0f}"
+
+
+def _build_notifiarr_alert_payload(ctx):
+    """Build a Notifiarr passthrough payload for a balance alert."""
+    min_bal = ctx["min_balance"]
+    shortfall = ctx["shortfall"]
+    transfer = ctx["transfer_to_target"]
+    channel = int(NOTIFIARR_CHANNEL_ID)
+
+    color = "E74C3C" if min_bal < 0 else "FF8C00"
+
+    description = (
+        f"Projected minimum {_fmt_dollars(min_bal)} on {ctx['min_date'].strftime('%b %d')} "
+        f"is {_fmt_dollars(shortfall)} below the {_fmt_dollars(ctx['alert_threshold'])} alert threshold."
     )
 
+    min_date_str = ctx["min_date"].strftime("%b %d")
+    proj_min_text = f"{_fmt_dollars(min_bal)} on {min_date_str}"
+    alert_label = f"Alert ({ctx['alert_buffer_days']}d)"
+    target_label = f"Target ({ctx['target_buffer_days']}d)"
+
+    fields = [
+        {"title": "Current Balance", "text": _fmt_dollars(ctx["current_balance"]), "inline": True},
+        {"title": "Projected Min", "text": proj_min_text, "inline": True},
+        {"title": "Shortfall", "text": _fmt_dollars(shortfall), "inline": True},
+        {"title": alert_label, "text": _fmt_dollars(ctx["alert_threshold"]), "inline": True},
+        {"title": target_label, "text": _fmt_dollars(ctx["target_threshold"]), "inline": True},
+        {"title": "Transfer to Target", "text": _fmt_dollars(transfer), "inline": True},
+    ]
+
+    # Upcoming outflows
+    if ctx["upcoming_outflows"]:
+        outflow_lines = []
+        for t in ctx["upcoming_outflows"]:
+            outflow_lines.append(f"{t['date'].strftime('%b %d')}: {t['payee']}  {_fmt_dollars(t['amount'])}")
+        fields.append({"title": "Key Upcoming Outflows", "text": "\n".join(outflow_lines), "inline": False})
+
+    # CC payments
+    if ctx["cc_payments"]:
+        cc_lines = [f"{p['name']}: {_fmt_dollars(p['amount'])}" for p in ctx["cc_payments"].values()]
+        fields.append({"title": "CC Payments", "text": "\n".join(cc_lines), "inline": False})
+
+    # Action
+    action = f"Transfer {_fmt_dollars(transfer)} from HYSA before {ctx['min_date'].strftime('%b %d')} to reach target."
+    fields.append({"title": "Recommended Action", "text": action, "inline": False})
+
+    return {
+        "notification": {
+            "update": True,
+            "name": APP_NAME,
+            "event": "ynab-alert",
+        },
+        "discord": {
+            "color": color,
+            "text": {
+                "title": f"Transfer {_fmt_dollars(transfer)} to Checking",
+                "description": description,
+                "fields": fields,
+                "footer": f"{APP_NAME} v{APP_VERSION} \u2022 Through {ctx['end_date'].strftime('%b %d, %Y')}",
+            },
+            "ids": {"channel": channel},
+        },
+    }
+
+
+def _build_notifiarr_update_payload(ctx):
+    """Build a Notifiarr passthrough payload for a routine balance update."""
+    min_bal = ctx["min_balance"]
+    channel = int(NOTIFIARR_UPDATE_CHANNEL_ID or NOTIFIARR_CHANNEL_ID)
+
+    if min_bal < ctx["alert_threshold"]:
+        color = "E74C3C"
+        status = "BELOW ALERT"
+    elif min_bal < ctx["target_threshold"]:
+        color = "F39C12"
+        status = "Below Target"
+    else:
+        color = "2ECC71"
+        status = "On Track"
+
+    buf_days = ctx["buffer_days_remaining"]
+    buf_text = f"~{buf_days:.0f} days" if buf_days < 999 else "999+ days"
+    min_date_str = ctx["min_date"].strftime("%b %d")
+    proj_min_text = f"{_fmt_dollars(min_bal)} on {min_date_str}"
+    alert_label = f"Alert ({ctx['alert_buffer_days']}d)"
+    target_label = f"Target ({ctx['target_buffer_days']}d)"
+    daily_text = f"${ctx['avg_daily_expenses']:,.0f}/day"
+
+    fields = [
+        {"title": "Current Balance", "text": _fmt_dollars(ctx["current_balance"]), "inline": True},
+        {"title": "Projected Min", "text": proj_min_text, "inline": True},
+        {"title": "Buffer Days", "text": buf_text, "inline": True},
+        {"title": alert_label, "text": _fmt_dollars(ctx["alert_threshold"]), "inline": True},
+        {"title": target_label, "text": _fmt_dollars(ctx["target_threshold"]), "inline": True},
+        {"title": "Avg Daily Spend", "text": daily_text, "inline": True},
+    ]
+
+    return {
+        "notification": {
+            "update": True,
+            "name": APP_NAME,
+            "event": "ynab-update",
+        },
+        "discord": {
+            "color": color,
+            "text": {
+                "title": f"Checking {_fmt_dollars(min_bal)} min \u2014 {status}",
+                "fields": fields,
+                "footer": f"{APP_NAME} v{APP_VERSION} \u2022 Through {ctx['end_date'].strftime('%b %d, %Y')}",
+            },
+            "ids": {"channel": channel},
+        },
+    }
+
+
+def send_alert_notification(ctx):
+    """Send a below-threshold alert via Notifiarr (preferred) or Apprise (fallback)."""
+    if _notifiarr_configured():
+        payload = _build_notifiarr_alert_payload(ctx)
+        if _send_notifiarr(payload):
+            print("\nAlert notification sent via Notifiarr")
+            return
+        if not APPRISE_URLS:
+            print("Notifiarr failed and no Apprise URLs configured", file=sys.stderr)
+            sys.exit(1)
+        print("Notifiarr failed, falling back to Apprise", file=sys.stderr)
+
+    shortfall = ctx["shortfall"]
+    transfer = ctx["transfer_to_target"]
+    min_bal = ctx["min_balance"]
+    title = f"{APP_NAME}: Transfer {_fmt_dollars(transfer)} to checking"
+
+    lines = [
+        f"Projected minimum {_fmt_dollars(min_bal)} on {ctx['min_date'].strftime('%b %d')} "
+        f"is {_fmt_dollars(shortfall)} below the {_fmt_dollars(ctx['alert_threshold'])} alert threshold.",
+        f"Current balance: {_fmt_dollars(ctx['current_balance'])}",
+        f"Alert ({ctx['alert_buffer_days']}d): {_fmt_dollars(ctx['alert_threshold'])} | "
+        f"Target ({ctx['target_buffer_days']}d): {_fmt_dollars(ctx['target_threshold'])}",
+    ]
+    if ctx["upcoming_outflows"]:
+        lines.append("Upcoming outflows:")
+        for t in ctx["upcoming_outflows"]:
+            lines.append(f"  {t['date'].strftime('%b %d')}: {t['payee']}  {_fmt_dollars(t['amount'])}")
+    lines.append(f"Action: Transfer {_fmt_dollars(transfer)} from HYSA before {ctx['min_date'].strftime('%b %d')}.")
+    message = "\n".join(lines)
+
     notifier = _build_notifier(APPRISE_URLS)
-    notify_type = apprise.NotifyType.WARNING if min_balance < 0 else apprise.NotifyType.INFO
+    notify_type = apprise.NotifyType.WARNING if min_bal < 0 else apprise.NotifyType.INFO
 
     if not notifier.notify(title=title, body=message, notify_type=notify_type):
         print("Failed to send alert via Apprise", file=sys.stderr)
@@ -759,27 +990,40 @@ def send_alert_notification(current_balance, min_balance, min_date, alert_thresh
     print("\nAlert notification sent via Apprise")
 
 
-def send_update_notification(current_balance, min_balance, min_date, end_date, alert_threshold, target_threshold):
-    """Send a routine projected-balance update via Apprise."""
-    if min_balance < alert_threshold:
+def send_update_notification(ctx):
+    """Send a routine projected-balance update via Notifiarr (preferred) or Apprise (fallback)."""
+    if _notifiarr_configured():
+        payload = _build_notifiarr_update_payload(ctx)
+        if _send_notifiarr(payload):
+            print("\nUpdate notification sent via Notifiarr")
+            return
+        if not (UPDATE_APPRISE_URLS or APPRISE_URLS):
+            print("Notifiarr failed and no Apprise URLs configured", file=sys.stderr)
+            return
+        print("Notifiarr failed, falling back to Apprise", file=sys.stderr)
+
+    min_bal = ctx["min_balance"]
+    if min_bal < ctx["alert_threshold"]:
         status = "BELOW ALERT"
-        title = f"{APP_NAME}: Checking ${min_balance:,.0f} min — {status}"
-    elif min_balance < target_threshold:
-        status = "below target"
-        title = f"{APP_NAME}: Checking ${min_balance:,.0f} min — {status}"
+    elif min_bal < ctx["target_threshold"]:
+        status = "Below Target"
     else:
-        status = "on track"
-        title = f"{APP_NAME}: Checking ${min_balance:,.0f} min — {status}"
+        status = "On Track"
+    title = f"{APP_NAME}: Checking {_fmt_dollars(min_bal)} min \u2014 {status}"
+
+    buf_days = ctx["buffer_days_remaining"]
     message = (
-        f"Current: ${current_balance:,.0f} | "
-        f"Min: ${min_balance:,.0f} on {min_date.strftime('%b %d')}\n"
-        f"Alert: ${alert_threshold:,.0f} | Target: ${target_threshold:,.0f}\n"
-        f"Through {end_date.strftime('%b %d, %Y')}"
+        f"Current: {_fmt_dollars(ctx['current_balance'])} | "
+        f"Min: {_fmt_dollars(min_bal)} on {ctx['min_date'].strftime('%b %d')}\n"
+        f"Alert ({ctx['alert_buffer_days']}d): {_fmt_dollars(ctx['alert_threshold'])} | "
+        f"Target ({ctx['target_buffer_days']}d): {_fmt_dollars(ctx['target_threshold'])}\n"
+        f"Buffer: ~{buf_days:.0f} days | Avg spend: ${ctx['avg_daily_expenses']:,.0f}/day\n"
+        f"Through {ctx['end_date'].strftime('%b %d, %Y')}"
     )
 
     urls = UPDATE_APPRISE_URLS or APPRISE_URLS
     notifier = _build_notifier(urls)
-    notify_type = apprise.NotifyType.WARNING if min_balance < alert_threshold else apprise.NotifyType.SUCCESS
+    notify_type = apprise.NotifyType.WARNING if min_bal < ctx["alert_threshold"] else apprise.NotifyType.SUCCESS
 
     if not notifier.notify(title=title, body=message, notify_type=notify_type):
         print("Failed to send update notification via Apprise", file=sys.stderr)
@@ -812,8 +1056,10 @@ def validate_config():
                 errors.append(f"YNAB_ACCOUNT_ID contains invalid UUID: '{aid}'")
     if not _is_valid_uuid(YNAB_BUDGET_ID):
         errors.append(f"YNAB_BUDGET_ID must be a valid UUID or 'last-used', got: '{YNAB_BUDGET_ID}'")
-    if not APPRISE_URLS:
-        errors.append("APPRISE_URLS is required")
+    if not APPRISE_URLS and not _notifiarr_configured():
+        errors.append("APPRISE_URLS or NOTIFIARR_API_KEY + NOTIFIARR_CHANNEL_ID is required")
+    if NOTIFIARR_API_KEY and not NOTIFIARR_CHANNEL_ID:
+        errors.append("NOTIFIARR_CHANNEL_ID is required when NOTIFIARR_API_KEY is set")
     if MONITOR_DAYS:
         try:
             days = int(MONITOR_DAYS)
@@ -861,15 +1107,28 @@ def run_check(send_update=False):
 
     min_balance, min_date = project_minimum_balance(balance, transactions, cc_payments, end_date)
 
+    ctx = _build_notification_context(
+        balance=balance,
+        accounts=accounts,
+        min_balance=min_balance,
+        min_date=min_date,
+        end_date=end_date,
+        alert_threshold=alert_threshold,
+        target_threshold=target_threshold,
+        avg_daily=avg_daily,
+        transactions=transactions,
+        cc_payments=cc_payments,
+    )
+
     if min_balance < alert_threshold:
         shortfall = alert_threshold - min_balance
         print(f"\n⚠ ALERT: Projected balance drops ${shortfall:,.0f} below alert threshold!")
-        send_alert_notification(balance, min_balance, min_date, alert_threshold, target_threshold)
+        send_alert_notification(ctx)
     else:
         print(f"\n✓ Balance stays above ${alert_threshold:,.0f} alert threshold.")
 
     if send_update:
-        send_update_notification(balance, min_balance, min_date, end_date, alert_threshold, target_threshold)
+        send_update_notification(ctx)
 
 
 # ---------------------------------------------------------------------------
