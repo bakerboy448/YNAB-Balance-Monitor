@@ -12,6 +12,9 @@ line-length = 120
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM"]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["I001", "E402"]
+
 [tool.semantic_release]
 version_variables = ["ynab_balance_monitor.py:APP_VERSION"]
 branch = "main"

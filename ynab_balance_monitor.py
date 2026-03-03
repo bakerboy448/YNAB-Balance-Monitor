@@ -846,23 +846,31 @@ def _build_notifiarr_alert_payload(ctx):
 
     color = "E74C3C" if min_bal < 0 else "FF8C00"
 
+    min_date_str = ctx["min_date"].strftime("%b %d")
+    daily_text = f"${ctx['avg_daily_expenses']:,.0f}/day"
+
     description = (
-        f"Projected minimum {_fmt_dollars(min_bal)} on {ctx['min_date'].strftime('%b %d')} "
-        f"is {_fmt_dollars(shortfall)} below the {_fmt_dollars(ctx['alert_threshold'])} alert threshold."
+        f"After all scheduled bills and CC payments, checking will bottom out at "
+        f"**{_fmt_dollars(min_bal)}** on **{min_date_str}** — "
+        f"that's {_fmt_dollars(shortfall)} less than the {ctx['alert_buffer_days']}-day "
+        f"spending cushion ({_fmt_dollars(ctx['alert_threshold'])})."
     )
 
-    min_date_str = ctx["min_date"].strftime("%b %d")
-    proj_min_text = f"{_fmt_dollars(min_bal)} on {min_date_str}"
-    alert_label = f"Alert ({ctx['alert_buffer_days']}d)"
-    target_label = f"Target ({ctx['target_buffer_days']}d)"
-
     fields = [
-        {"title": "Current Balance", "text": _fmt_dollars(ctx["current_balance"]), "inline": True},
-        {"title": "Projected Min", "text": proj_min_text, "inline": True},
-        {"title": "Shortfall", "text": _fmt_dollars(shortfall), "inline": True},
-        {"title": alert_label, "text": _fmt_dollars(ctx["alert_threshold"]), "inline": True},
-        {"title": target_label, "text": _fmt_dollars(ctx["target_threshold"]), "inline": True},
-        {"title": "Transfer to Target", "text": _fmt_dollars(transfer), "inline": True},
+        {"title": "Balance Now", "text": _fmt_dollars(ctx["current_balance"]), "inline": True},
+        {"title": "Lowest Point", "text": f"{_fmt_dollars(min_bal)} on {min_date_str}", "inline": True},
+        {"title": "Below Alert By", "text": _fmt_dollars(shortfall), "inline": True},
+        {
+            "title": f"Alert Cushion ({ctx['alert_buffer_days']}d spend)",
+            "text": f"{_fmt_dollars(ctx['alert_threshold'])} ({daily_text} \u00d7 {ctx['alert_buffer_days']}d)",
+            "inline": True,
+        },
+        {
+            "title": f"Target Cushion ({ctx['target_buffer_days']}d spend)",
+            "text": f"{_fmt_dollars(ctx['target_threshold'])} ({daily_text} \u00d7 {ctx['target_buffer_days']}d)",
+            "inline": True,
+        },
+        {"title": "Transfer Needed", "text": _fmt_dollars(transfer), "inline": True},
     ]
 
     # Upcoming outflows
@@ -870,16 +878,19 @@ def _build_notifiarr_alert_payload(ctx):
         outflow_lines = []
         for t in ctx["upcoming_outflows"]:
             outflow_lines.append(f"{t['date'].strftime('%b %d')}: {t['payee']}  {_fmt_dollars(t['amount'])}")
-        fields.append({"title": "Key Upcoming Outflows", "text": "\n".join(outflow_lines), "inline": False})
+        fields.append({"title": "Upcoming Bills", "text": "\n".join(outflow_lines), "inline": False})
 
     # CC payments
     if ctx["cc_payments"]:
         cc_lines = [f"{p['name']}: {_fmt_dollars(p['amount'])}" for p in ctx["cc_payments"].values()]
-        fields.append({"title": "CC Payments", "text": "\n".join(cc_lines), "inline": False})
+        fields.append({"title": "CC Payments Leaving Checking", "text": "\n".join(cc_lines), "inline": False})
 
     # Action
-    action = f"Transfer {_fmt_dollars(transfer)} from HYSA before {ctx['min_date'].strftime('%b %d')} to reach target."
-    fields.append({"title": "Recommended Action", "text": action, "inline": False})
+    action = (
+        f"Transfer **{_fmt_dollars(transfer)}** from HYSA \u2192 checking before "
+        f"{min_date_str} to maintain {ctx['target_buffer_days']}-day cushion."
+    )
+    fields.append({"title": "Action", "text": action, "inline": False})
 
     return {
         "notification": {
@@ -916,20 +927,31 @@ def _build_notifiarr_update_payload(ctx):
         status = "On Track"
 
     buf_days = ctx["buffer_days_remaining"]
-    buf_text = f"~{buf_days:.0f} days" if buf_days < 999 else "999+ days"
+    buf_text = f"~{buf_days:.0f} days of spending" if buf_days < 999 else "999+ days"
     min_date_str = ctx["min_date"].strftime("%b %d")
-    proj_min_text = f"{_fmt_dollars(min_bal)} on {min_date_str}"
-    alert_label = f"Alert ({ctx['alert_buffer_days']}d)"
-    target_label = f"Target ({ctx['target_buffer_days']}d)"
     daily_text = f"${ctx['avg_daily_expenses']:,.0f}/day"
 
+    description = (
+        f"After all scheduled bills and CC payments clear, checking bottoms out at "
+        f"**{_fmt_dollars(min_bal)}** on **{min_date_str}** — "
+        f"that covers {buf_text}."
+    )
+
     fields = [
-        {"title": "Current Balance", "text": _fmt_dollars(ctx["current_balance"]), "inline": True},
-        {"title": "Projected Min", "text": proj_min_text, "inline": True},
-        {"title": "Buffer Days", "text": buf_text, "inline": True},
-        {"title": alert_label, "text": _fmt_dollars(ctx["alert_threshold"]), "inline": True},
-        {"title": target_label, "text": _fmt_dollars(ctx["target_threshold"]), "inline": True},
-        {"title": "Avg Daily Spend", "text": daily_text, "inline": True},
+        {"title": "Balance Now", "text": _fmt_dollars(ctx["current_balance"]), "inline": True},
+        {"title": "Lowest Point", "text": f"{_fmt_dollars(min_bal)} on {min_date_str}", "inline": True},
+        {"title": "Covers", "text": buf_text, "inline": True},
+        {
+            "title": f"Alert Cushion ({ctx['alert_buffer_days']}d)",
+            "text": f"{_fmt_dollars(ctx['alert_threshold'])} ({daily_text} \u00d7 {ctx['alert_buffer_days']}d)",
+            "inline": True,
+        },
+        {
+            "title": f"Target Cushion ({ctx['target_buffer_days']}d)",
+            "text": f"{_fmt_dollars(ctx['target_threshold'])} ({daily_text} \u00d7 {ctx['target_buffer_days']}d)",
+            "inline": True,
+        },
+        {"title": "Avg Daily Spend", "text": f"{daily_text} (13-mo avg)", "inline": True},
     ]
 
     return {
@@ -941,7 +963,8 @@ def _build_notifiarr_update_payload(ctx):
         "discord": {
             "color": color,
             "text": {
-                "title": f"Checking {_fmt_dollars(min_bal)} min \u2014 {status}",
+                "title": f"Checking \u2014 {status}",
+                "description": description,
                 "fields": fields,
                 "footer": f"{APP_NAME} v{APP_VERSION} \u2022 Through {ctx['end_date'].strftime('%b %d, %Y')}",
             },
@@ -965,20 +988,35 @@ def send_alert_notification(ctx):
     shortfall = ctx["shortfall"]
     transfer = ctx["transfer_to_target"]
     min_bal = ctx["min_balance"]
+    daily = ctx["avg_daily_expenses"]
     title = f"{APP_NAME}: Transfer {_fmt_dollars(transfer)} to checking"
 
     lines = [
-        f"Projected minimum {_fmt_dollars(min_bal)} on {ctx['min_date'].strftime('%b %d')} "
-        f"is {_fmt_dollars(shortfall)} below the {_fmt_dollars(ctx['alert_threshold'])} alert threshold.",
-        f"Current balance: {_fmt_dollars(ctx['current_balance'])}",
-        f"Alert ({ctx['alert_buffer_days']}d): {_fmt_dollars(ctx['alert_threshold'])} | "
-        f"Target ({ctx['target_buffer_days']}d): {_fmt_dollars(ctx['target_threshold'])}",
+        f"After all scheduled bills and CC payments, checking bottoms out at "
+        f"{_fmt_dollars(min_bal)} on {ctx['min_date'].strftime('%b %d')} — "
+        f"that's {_fmt_dollars(shortfall)} below the alert cushion.",
+        "",
+        f"Balance now: {_fmt_dollars(ctx['current_balance'])}",
+        f"Lowest point: {_fmt_dollars(min_bal)} on {ctx['min_date'].strftime('%b %d')}",
+        f"Avg daily spend: ${daily:,.0f}/day (13-mo avg)",
+        f"Alert cushion: {_fmt_dollars(ctx['alert_threshold'])} (${daily:,.0f}/day x {ctx['alert_buffer_days']}d)",
+        f"Target cushion: {_fmt_dollars(ctx['target_threshold'])} (${daily:,.0f}/day x {ctx['target_buffer_days']}d)",
     ]
     if ctx["upcoming_outflows"]:
-        lines.append("Upcoming outflows:")
+        lines.append("")
+        lines.append("Upcoming bills:")
         for t in ctx["upcoming_outflows"]:
             lines.append(f"  {t['date'].strftime('%b %d')}: {t['payee']}  {_fmt_dollars(t['amount'])}")
-    lines.append(f"Action: Transfer {_fmt_dollars(transfer)} from HYSA before {ctx['min_date'].strftime('%b %d')}.")
+    if ctx["cc_payments"]:
+        lines.append("")
+        lines.append("CC payments leaving checking:")
+        for p in ctx["cc_payments"].values():
+            lines.append(f"  {p['name']}: {_fmt_dollars(p['amount'])}")
+    lines.append("")
+    lines.append(
+        f"Action: Transfer {_fmt_dollars(transfer)} from HYSA -> checking before "
+        f"{ctx['min_date'].strftime('%b %d')} to maintain {ctx['target_buffer_days']}-day cushion."
+    )
     message = "\n".join(lines)
 
     notifier = _build_notifier(APPRISE_URLS)
@@ -1010,17 +1048,25 @@ def send_update_notification(ctx):
         status = "Below Target"
     else:
         status = "On Track"
-    title = f"{APP_NAME}: Checking {_fmt_dollars(min_bal)} min \u2014 {status}"
+    title = f"{APP_NAME}: Checking \u2014 {status}"
 
     buf_days = ctx["buffer_days_remaining"]
-    message = (
-        f"Current: {_fmt_dollars(ctx['current_balance'])} | "
-        f"Min: {_fmt_dollars(min_bal)} on {ctx['min_date'].strftime('%b %d')}\n"
-        f"Alert ({ctx['alert_buffer_days']}d): {_fmt_dollars(ctx['alert_threshold'])} | "
-        f"Target ({ctx['target_buffer_days']}d): {_fmt_dollars(ctx['target_threshold'])}\n"
-        f"Buffer: ~{buf_days:.0f} days | Avg spend: ${ctx['avg_daily_expenses']:,.0f}/day\n"
-        f"Through {ctx['end_date'].strftime('%b %d, %Y')}"
-    )
+    buf_text = f"~{buf_days:.0f} days" if buf_days < 999 else "999+ days"
+    daily = ctx["avg_daily_expenses"]
+    min_date_str = ctx["min_date"].strftime("%b %d")
+
+    lines = [
+        f"After all scheduled bills and CC payments, checking bottoms out at "
+        f"{_fmt_dollars(min_bal)} on {min_date_str} \u2014 that covers {buf_text} of spending.",
+        "",
+        f"Balance now: {_fmt_dollars(ctx['current_balance'])}",
+        f"Lowest point: {_fmt_dollars(min_bal)} on {min_date_str}",
+        f"Avg daily spend: ${daily:,.0f}/day (13-mo avg)",
+        f"Alert cushion: {_fmt_dollars(ctx['alert_threshold'])} (${daily:,.0f}/day x {ctx['alert_buffer_days']}d)",
+        f"Target cushion: {_fmt_dollars(ctx['target_threshold'])} (${daily:,.0f}/day x {ctx['target_buffer_days']}d)",
+        f"Through {ctx['end_date'].strftime('%b %d, %Y')}",
+    ]
+    message = "\n".join(lines)
 
     urls = UPDATE_APPRISE_URLS or APPRISE_URLS
     notifier = _build_notifier(urls)
