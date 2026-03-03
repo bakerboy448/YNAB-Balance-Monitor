@@ -1,6 +1,53 @@
 # CHANGELOG
 
 
+## v1.2.0-rc.1 (2026-03-03)
+
+### Bug Fixes
+
+- Pass Notifiarr API key via x-api-key header instead of URL path
+  ([`6a8bf53`](https://github.com/bakerboy448/YNAB-Balance-Monitor/commit/6a8bf53c23bb25ed411359de611ad60cab1407ed))
+
+Headers don't leak in server access logs or proxy logs.
+
+- Resolve ruff lint errors
+  ([`6900486`](https://github.com/bakerboy448/YNAB-Balance-Monitor/commit/6900486a6aaaddb99fde001a2bb519508f6920d3))
+
+- Sort imports (I001) - Replace socket.timeout with TimeoutError (UP041) - Use ternary operators for
+  simple if-else blocks (SIM108) - Break long lines under 120 chars (E501) - Remove extraneous
+  f-string prefixes (F541)
+
+### Code Style
+
+- Apply ruff format
+  ([`2a2faf3`](https://github.com/bakerboy448/YNAB-Balance-Monitor/commit/2a2faf3d69483ac579bf38cfe7810d19a57e8cad))
+
+Auto-formatted with ruff 0.15.4 to pass CI format check.
+
+### Documentation
+
+- Add CI and license badges, clean up CLAUDE.md
+  ([`540f894`](https://github.com/bakerboy448/YNAB-Balance-Monitor/commit/540f894597db27e68fc6e0950a976b9c6f26b9e9))
+
+### Features
+
+- Add Notifiarr passthrough notifications with rich Discord embeds
+  ([`b3c5548`](https://github.com/bakerboy448/YNAB-Balance-Monitor/commit/b3c5548f44ec6a6fa3e2066c639fc3eec15cdf09))
+
+Send color-coded Discord embeds via Notifiarr passthrough API with inline fields for balances,
+  thresholds, upcoming outflows, and actionable transfer recommendations. Alerts and updates use
+  message editing (update: true) to avoid notification spam. Apprise remains as fallback when
+  Notifiarr is not configured, with improved message detail including buffer days and daily spend.
+
+- Improve notification clarity with self-describing labels and formulas
+  ([`8aa8d29`](https://github.com/bakerboy448/YNAB-Balance-Monitor/commit/8aa8d295bda77aebac20d5cc59ad1c3ddb5cc387))
+
+Rewrite all 4 notification builders (Notifiarr alert/update, Apprise alert/update) to use narrative
+  descriptions and show the math behind every threshold. Fields renamed from cryptic abbreviations
+  (e.g. "Alert (15d)") to plain language ("Alert Cushion (15d spend): $3,600 ($240/day x 15d)"). Add
+  40 unit tests covering all notification payloads and message formats.
+
+
 ## v1.1.0 (2026-02-26)
 
 ### Features

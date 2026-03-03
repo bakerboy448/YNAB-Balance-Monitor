@@ -44,7 +44,7 @@ YNAB_BASE = "https://api.ynab.com/v1"
 YNAB_API_TIMEOUT = 30  # seconds
 
 APP_NAME = "YNAB Monitor"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0-rc.1"
 USER_AGENT = f"YNAB-Balance-Monitor/{APP_VERSION} (+https://github.com/bakerboy448/YNAB-Balance-Monitor)"
 
 # ---------------------------------------------------------------------------
