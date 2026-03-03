@@ -1,6 +1,25 @@
 # CHANGELOG
 
 
+## v1.2.0-rc.3 (2026-03-03)
+
+### Bug Fixes
+
+- Show all CC payments with scheduled/unscheduled labels
+  ([`dcbd92b`](https://github.com/bakerboy448/YNAB-Balance-Monitor/commit/dcbd92b4bff7809020dddf9d670a8e264cedcc74))
+
+Instead of hiding covered CC payments (which removed useful context), tag each with (scheduled) or
+  (unscheduled) so users can see all CC payment amounts while understanding which are already in
+  upcoming bills.
+
+Also adds scripts/release.sh to automate push -> release -> rebuild.
+
+### Chores
+
+- Ignore .claude/settings.local.json
+  ([`c548b14`](https://github.com/bakerboy448/YNAB-Balance-Monitor/commit/c548b146e172cd5405766290689e96445390c4a2))
+
+
 ## v1.2.0-rc.2 (2026-03-03)
 
 ### Bug Fixes
