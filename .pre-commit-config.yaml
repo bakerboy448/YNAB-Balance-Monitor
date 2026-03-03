@@ -1,0 +1,70 @@
+# Pre-commit hooks for YNAB Balance Monitor
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+        args: ['--maxkb=500']
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-case-conflict
+      - id: mixed-line-ending
+        args: ['--fix=lf']
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.4
+    hooks:
+      - id: ruff
+        args: ['--fix']
+      - id: ruff-format
+
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ['--baseline', '.secrets.baseline']
+        exclude: ^\.env\.example$
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+
+  - repo: local
+    hooks:
+      - id: no-pii-patterns
+        name: Check for PII patterns (account numbers, real names)
+        entry: bash
+        args:
+          - '-c'
+          - |
+            # Check staged files for known PII patterns
+            # Add patterns here as they are discovered
+            patterns=(
+              'CIBC Bank'
+              'DG Checking'
+              'Ally Checking [0-9]'
+              'Turnberry'
+              'Wintrust'
+              'Hilton Honors'
+              'SavorOne [0-9]'
+            )
+            failed=0
+            for pattern in "${patterns[@]}"; do
+              if git diff --cached --diff-filter=d -U0 | grep -iP "^\+.*$pattern" >/dev/null 2>&1; then
+                echo "PII detected: pattern '$pattern' found in staged changes"
+                failed=1
+              fi
+            done
+            if [ $failed -ne 0 ]; then
+              echo ""
+              echo "ERROR: PII patterns found. Use generic names in code/tests/docs."
+              exit 1
+            fi
+        language: system
+        pass_filenames: false
+        always_run: true
