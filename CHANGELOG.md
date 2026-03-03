@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v1.2.0-rc.2 (2026-03-03)
+
+### Bug Fixes
+
+- Exclude scheduled CC payments from notification CC section
+  ([`7f25c2a`](https://github.com/bakerboy448/YNAB-Balance-Monitor/commit/7f25c2a135f332adc94e3d0e5ce6212219ae920c))
+
+CC payments with scheduled transfers (e.g. CapitalOne, Discover) were displayed in both "Upcoming
+  Bills" and "CC Payments Leaving Checking", appearing double-counted. Now project_minimum_balance()
+  returns covered_cc_ids, and _build_notification_context() filters them out. Only truly unscheduled
+  CC payments appear in the renamed "Unscheduled CC Payments" section.
+
+
 ## v1.2.0-rc.1 (2026-03-03)
 
 ### Bug Fixes
