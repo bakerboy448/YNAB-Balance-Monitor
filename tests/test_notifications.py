@@ -44,6 +44,12 @@ def alert_ctx():
             {"date": date(2026, 3, 15), "payee": "Mortgage", "amount": -2500},
             {"date": date(2026, 3, 20), "payee": "Car Payment", "amount": -450},
         ],
+        "scheduled_inflows": OrderedDict(
+            [
+                ("Employer Payroll", {"amount": 7054, "count": 2}),
+                ("Transfer : Savings", {"amount": 2500, "count": 1}),
+            ]
+        ),
         "cc_payments": OrderedDict(
             [
                 ("chase", {"name": "Chase Visa", "amount": -800, "scheduled": True}),
@@ -67,6 +73,11 @@ def update_ctx_on_track():
         "target_buffer_days": 30,
         "avg_daily_expenses": 240,
         "buffer_days_remaining": 33.75,
+        "scheduled_inflows": OrderedDict(
+            [
+                ("Employer Payroll", {"amount": 7054, "count": 2}),
+            ]
+        ),
         "cc_payments": OrderedDict(
             [
                 ("chase", {"name": "Chase Visa", "amount": -800, "scheduled": True}),
@@ -90,6 +101,11 @@ def update_ctx_below_target():
         "target_buffer_days": 30,
         "avg_daily_expenses": 240,
         "buffer_days_remaining": 20.8,
+        "scheduled_inflows": OrderedDict(
+            [
+                ("Employer Payroll", {"amount": 7054, "count": 2}),
+            ]
+        ),
         "cc_payments": OrderedDict(
             [
                 ("chase", {"name": "Chase Visa", "amount": -800, "scheduled": True}),
@@ -112,6 +128,11 @@ def update_ctx_below_alert():
         "target_buffer_days": 30,
         "avg_daily_expenses": 240,
         "buffer_days_remaining": 12.9,
+        "scheduled_inflows": OrderedDict(
+            [
+                ("Employer Payroll", {"amount": 3527, "count": 1}),
+            ]
+        ),
         "cc_payments": OrderedDict(
             [
                 ("chase", {"name": "Chase Visa", "amount": -800, "scheduled": True}),

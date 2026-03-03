@@ -104,22 +104,22 @@ python ynab_balance_monitor.py [--dry-run | --daemon]
 YNAB Balance Monitor -- 2026-02-24 19:13
 Projecting through 2026-04-25, min floor: $500.00
 ============================================================
-Account: DG Checking 3969
+Account: My Checking 1234
   Balance: $11,686.73
-Account: Ally Checking 9958
+Account: Savings 5678
   Balance: $1,918.52
 Combined balance: $13,605.25
 
 Scheduled transactions through 2026-04-25: 28
-  2026-02-26  Turnberry Manor Condo Association (monthly)  $   -274.95
-  2026-02-27  Transfer : Chase Unlimited 9765 (monthly)    $ -2,902.05
-  2026-02-28  CIBC Bank USA (monthly)                      $  3,568.01
+  2026-02-26  HOA (monthly)                               $   -274.95
+  2026-02-27  Transfer : Visa 9999 (monthly)              $ -2,902.05
+  2026-02-28  Employer Payroll (monthly)                   $  3,568.01
   ...
 
 Credit card payments to account for: $10,217.30
-  Chase Freedom 9177              $  1,788.03 (statement (2026-01-25))
-  Discover 9356                   $      7.99 (statement (2026-02-09))
-  Chase Unlimited 9765            $  2,902.05 (statement (2026-02-02))
+  Visa 9999                       $  1,788.03 (statement (2026-01-25))
+  Discover 0000                   $      7.99 (statement (2026-02-09))
+  Amex 1111                       $  2,902.05 (statement (2026-02-02))
   ...
 
 Trailing 13-month expenses:

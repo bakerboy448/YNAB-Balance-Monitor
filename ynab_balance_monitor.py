@@ -820,6 +820,17 @@ def _build_notification_context(
         key=lambda t: t["amount"],
     )[:5]
 
+    # Scheduled inflows — aggregate by payee (income + transfers in)
+    inflow_totals = {}
+    for t in transactions:
+        if t["amount"] > 0:
+            payee = t["payee"]
+            if payee not in inflow_totals:
+                inflow_totals[payee] = {"amount": t["amount"], "count": 1}
+            else:
+                inflow_totals[payee]["count"] += 1
+                inflow_totals[payee]["amount"] += t["amount"]
+
     # Tag each CC payment as scheduled or unscheduled
     tagged_cc = {}
     for cc_id, info in cc_payments.items():
@@ -840,6 +851,7 @@ def _build_notification_context(
         "shortfall": shortfall,
         "transfer_to_target": transfer_to_target,
         "upcoming_outflows": upcoming,
+        "scheduled_inflows": inflow_totals,
         "cc_payments": tagged_cc,
     }
 
@@ -886,6 +898,16 @@ def _build_notifiarr_alert_payload(ctx):
         },
         {"title": "Transfer Needed", "text": _fmt_dollars(transfer), "inline": True},
     ]
+
+    # Scheduled inflows (income + transfers in)
+    if ctx["scheduled_inflows"]:
+        inflow_lines = []
+        for payee, info in ctx["scheduled_inflows"].items():
+            if info["count"] > 1:
+                inflow_lines.append(f"{payee}: {_fmt_dollars(info['amount'])} ({info['count']}x)")
+            else:
+                inflow_lines.append(f"{payee}: {_fmt_dollars(info['amount'])}")
+        fields.append({"title": "Scheduled Income & Transfers In", "text": "\n".join(inflow_lines), "inline": False})
 
     # Upcoming outflows
     if ctx["upcoming_outflows"]:
@@ -971,6 +993,16 @@ def _build_notifiarr_update_payload(ctx):
         {"title": "Avg Daily Spend", "text": f"{daily_text} (13-mo avg)", "inline": True},
     ]
 
+    # Scheduled inflows (income + transfers in)
+    if ctx["scheduled_inflows"]:
+        inflow_lines = []
+        for payee, info in ctx["scheduled_inflows"].items():
+            if info["count"] > 1:
+                inflow_lines.append(f"{payee}: {_fmt_dollars(info['amount'])} ({info['count']}x)")
+            else:
+                inflow_lines.append(f"{payee}: {_fmt_dollars(info['amount'])}")
+        fields.append({"title": "Scheduled Income & Transfers In", "text": "\n".join(inflow_lines), "inline": False})
+
     # CC payments — label each as scheduled or unscheduled
     if ctx["cc_payments"]:
         cc_lines = []
@@ -1027,6 +1059,14 @@ def send_alert_notification(ctx):
         f"Alert cushion: {_fmt_dollars(ctx['alert_threshold'])} (${daily:,.0f}/day x {ctx['alert_buffer_days']}d)",
         f"Target cushion: {_fmt_dollars(ctx['target_threshold'])} (${daily:,.0f}/day x {ctx['target_buffer_days']}d)",
     ]
+    if ctx["scheduled_inflows"]:
+        lines.append("")
+        lines.append("Scheduled income & transfers in:")
+        for payee, info in ctx["scheduled_inflows"].items():
+            if info["count"] > 1:
+                lines.append(f"  {payee}: {_fmt_dollars(info['amount'])} ({info['count']}x)")
+            else:
+                lines.append(f"  {payee}: {_fmt_dollars(info['amount'])}")
     if ctx["upcoming_outflows"]:
         lines.append("")
         lines.append("Upcoming bills:")
@@ -1091,6 +1131,14 @@ def send_update_notification(ctx):
         f"Alert cushion: {_fmt_dollars(ctx['alert_threshold'])} (${daily:,.0f}/day x {ctx['alert_buffer_days']}d)",
         f"Target cushion: {_fmt_dollars(ctx['target_threshold'])} (${daily:,.0f}/day x {ctx['target_buffer_days']}d)",
     ]
+    if ctx["scheduled_inflows"]:
+        lines.append("")
+        lines.append("Scheduled income & transfers in:")
+        for payee, info in ctx["scheduled_inflows"].items():
+            if info["count"] > 1:
+                lines.append(f"  {payee}: {_fmt_dollars(info['amount'])} ({info['count']}x)")
+            else:
+                lines.append(f"  {payee}: {_fmt_dollars(info['amount'])}")
     if ctx["cc_payments"]:
         lines.append("")
         lines.append("CC payments:")
