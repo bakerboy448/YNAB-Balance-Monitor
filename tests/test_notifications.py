@@ -46,8 +46,8 @@ def alert_ctx():
         ],
         "cc_payments": OrderedDict(
             [
-                ("chase", {"name": "Chase Visa", "amount": -800}),
-                ("amex", {"name": "Amex Gold", "amount": -350}),
+                ("chase", {"name": "Chase Visa", "amount": -800, "scheduled": True}),
+                ("amex", {"name": "Amex Gold", "amount": -350, "scheduled": False}),
             ]
         ),
     }
@@ -125,9 +125,9 @@ class TestFmtDollars:
 # ---------------------------------------------------------------------------
 
 
-class TestNotificationContextCCFiltering:
-    def test_covered_cc_excluded(self):
-        """CC payments with scheduled transfers should be filtered out."""
+class TestNotificationContextCCTagging:
+    def test_covered_cc_tagged_scheduled(self):
+        """CC payments with scheduled transfers should be tagged scheduled=True."""
         cc_payments = OrderedDict(
             [
                 ("cc-1", {"name": "Chase Visa", "amount": -800}),
@@ -135,7 +135,7 @@ class TestNotificationContextCCFiltering:
                 ("cc-3", {"name": "Discover", "amount": -150}),
             ]
         )
-        covered = {"cc-1", "cc-3"}  # Chase and Discover have scheduled transfers
+        covered = {"cc-1", "cc-3"}
         ctx = m._build_notification_context(
             balance=10000,
             accounts=[],
@@ -149,14 +149,14 @@ class TestNotificationContextCCFiltering:
             cc_payments=cc_payments,
             covered_cc_ids=covered,
         )
-        # Only Amex Gold (cc-2) should remain — uncovered
-        assert len(ctx["cc_payments"]) == 1
-        assert "cc-2" in ctx["cc_payments"]
-        assert "cc-1" not in ctx["cc_payments"]
-        assert "cc-3" not in ctx["cc_payments"]
+        # All CCs preserved, but tagged
+        assert len(ctx["cc_payments"]) == 3
+        assert ctx["cc_payments"]["cc-1"]["scheduled"] is True
+        assert ctx["cc_payments"]["cc-2"]["scheduled"] is False
+        assert ctx["cc_payments"]["cc-3"]["scheduled"] is True
 
-    def test_no_covered_ids_keeps_all(self):
-        """When no covered_cc_ids, all CC payments pass through."""
+    def test_no_covered_ids_all_unscheduled(self):
+        """When no covered_cc_ids, all CC payments tagged as unscheduled."""
         cc_payments = OrderedDict(
             [
                 ("cc-1", {"name": "Chase Visa", "amount": -800}),
@@ -176,9 +176,11 @@ class TestNotificationContextCCFiltering:
             cc_payments=cc_payments,
         )
         assert len(ctx["cc_payments"]) == 2
+        assert ctx["cc_payments"]["cc-1"]["scheduled"] is False
+        assert ctx["cc_payments"]["cc-2"]["scheduled"] is False
 
-    def test_all_covered_means_empty(self):
-        """When all CCs are covered by scheduled transfers, cc_payments is empty."""
+    def test_all_covered_all_scheduled(self):
+        """When all CCs covered, all tagged scheduled=True."""
         cc_payments = OrderedDict(
             [
                 ("cc-1", {"name": "Chase Visa", "amount": -800}),
@@ -197,7 +199,8 @@ class TestNotificationContextCCFiltering:
             cc_payments=cc_payments,
             covered_cc_ids={"cc-1"},
         )
-        assert len(ctx["cc_payments"]) == 0
+        assert len(ctx["cc_payments"]) == 1
+        assert ctx["cc_payments"]["cc-1"]["scheduled"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -255,9 +258,16 @@ class TestNotifiarrAlertPayload:
     def test_cc_payments_field(self, alert_ctx):
         payload = m._build_notifiarr_alert_payload(alert_ctx)
         fields = payload["discord"]["text"]["fields"]
-        cc = next(f for f in fields if f["title"] == "Unscheduled CC Payments")
+        cc = next(f for f in fields if f["title"] == "CC Payments")
         assert "Chase Visa" in cc["text"]
         assert "Amex Gold" in cc["text"]
+
+    def test_cc_payments_scheduled_labels(self, alert_ctx):
+        payload = m._build_notifiarr_alert_payload(alert_ctx)
+        fields = payload["discord"]["text"]["fields"]
+        cc = next(f for f in fields if f["title"] == "CC Payments")
+        assert "*(scheduled)*" in cc["text"]
+        assert "*(unscheduled)*" in cc["text"]
 
     def test_action_field(self, alert_ctx):
         payload = m._build_notifiarr_alert_payload(alert_ctx)
@@ -279,7 +289,7 @@ class TestNotifiarrAlertPayload:
         payload = m._build_notifiarr_alert_payload(alert_ctx)
         fields = payload["discord"]["text"]["fields"]
         titles = [f["title"] for f in fields]
-        assert "Unscheduled CC Payments" not in titles
+        assert "CC Payments" not in titles
 
     def test_negative_balance_color(self, alert_ctx):
         alert_ctx["min_balance"] = -500
@@ -404,7 +414,7 @@ class TestAlertAppriseMessage:
         mock_notifier.return_value.notify.return_value = True
         m.send_alert_notification(alert_ctx)
         body = mock_notifier.return_value.notify.call_args[1]["body"]
-        assert "Unscheduled CC payments:" in body
+        assert "CC payments:" in body
         assert "Chase Visa" in body
         assert "Amex Gold" in body
 

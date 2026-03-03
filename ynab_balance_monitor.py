@@ -820,12 +820,10 @@ def _build_notification_context(
         key=lambda t: t["amount"],
     )[:5]
 
-    # Filter CC payments: only show unscheduled ones (covered CCs already
-    # appear as scheduled transfers in upcoming_outflows)
-    if covered_cc_ids:
-        unscheduled_cc = {cc_id: info for cc_id, info in cc_payments.items() if cc_id not in covered_cc_ids}
-    else:
-        unscheduled_cc = dict(cc_payments)
+    # Tag each CC payment as scheduled or unscheduled
+    tagged_cc = {}
+    for cc_id, info in cc_payments.items():
+        tagged_cc[cc_id] = {**info, "scheduled": bool(covered_cc_ids and cc_id in covered_cc_ids)}
 
     return {
         "current_balance": balance,
@@ -842,7 +840,7 @@ def _build_notification_context(
         "shortfall": shortfall,
         "transfer_to_target": transfer_to_target,
         "upcoming_outflows": upcoming,
-        "cc_payments": unscheduled_cc,
+        "cc_payments": tagged_cc,
     }
 
 
@@ -896,10 +894,13 @@ def _build_notifiarr_alert_payload(ctx):
             outflow_lines.append(f"{t['date'].strftime('%b %d')}: {t['payee']}  {_fmt_dollars(t['amount'])}")
         fields.append({"title": "Upcoming Bills", "text": "\n".join(outflow_lines), "inline": False})
 
-    # CC payments (only unscheduled — scheduled ones appear in Upcoming Bills)
+    # CC payments — label each as scheduled or unscheduled
     if ctx["cc_payments"]:
-        cc_lines = [f"{p['name']}: {_fmt_dollars(p['amount'])}" for p in ctx["cc_payments"].values()]
-        fields.append({"title": "Unscheduled CC Payments", "text": "\n".join(cc_lines), "inline": False})
+        cc_lines = []
+        for p in ctx["cc_payments"].values():
+            tag = " *(scheduled)*" if p.get("scheduled") else " *(unscheduled)*"
+            cc_lines.append(f"{p['name']}: {_fmt_dollars(p['amount'])}{tag}")
+        fields.append({"title": "CC Payments", "text": "\n".join(cc_lines), "inline": False})
 
     # Action
     action = (
@@ -1025,9 +1026,10 @@ def send_alert_notification(ctx):
             lines.append(f"  {t['date'].strftime('%b %d')}: {t['payee']}  {_fmt_dollars(t['amount'])}")
     if ctx["cc_payments"]:
         lines.append("")
-        lines.append("Unscheduled CC payments:")
+        lines.append("CC payments:")
         for p in ctx["cc_payments"].values():
-            lines.append(f"  {p['name']}: {_fmt_dollars(p['amount'])}")
+            tag = " (scheduled)" if p.get("scheduled") else " (unscheduled)"
+            lines.append(f"  {p['name']}: {_fmt_dollars(p['amount'])}{tag}")
     lines.append("")
     lines.append(
         f"Action: Transfer {_fmt_dollars(transfer)} from HYSA -> checking before "
