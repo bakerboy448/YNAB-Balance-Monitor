@@ -1,6 +1,17 @@
 # CHANGELOG
 
 
+## v1.2.0-rc.4 (2026-03-03)
+
+### Features
+
+- Add CC payments section to update notifications
+  ([`ce458d4`](https://github.com/bakerboy448/YNAB-Balance-Monitor/commit/ce458d44d3d14d0610a7f21ba0e3d5d254c91d63))
+
+Update notifications (Notifiarr embed + Apprise text) now show CC payments with
+  scheduled/unscheduled labels, matching the alert format.
+
+
 ## v1.2.0-rc.3 (2026-03-03)
 
 ### Bug Fixes
