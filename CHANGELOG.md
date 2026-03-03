@@ -1,6 +1,18 @@
 # CHANGELOG
 
 
+## v1.2.0-rc.5 (2026-03-03)
+
+### Features
+
+- Show scheduled income and transfers in notifications
+  ([`ca58499`](https://github.com/bakerboy448/YNAB-Balance-Monitor/commit/ca58499f166ac00fc434a3660095358a49b25af2))
+
+Notifications now include a "Scheduled Income & Transfers In" section listing all positive-amount
+  scheduled transactions (paychecks, HYSA transfers, etc.) with occurrence counts. Shown in all 4
+  notification builders (Notifiarr alert/update + Apprise alert/update).
+
+
 ## v1.2.0-rc.4 (2026-03-03)
 
 ### Features
@@ -127,7 +139,7 @@ The projection was applying all CC payments not found in the projection window a
 - Include CC-side transfers in scheduled transaction projection
   ([`8f09d31`](https://github.com/bakerboy448/YNAB-Balance-Monitor/commit/8f09d31e388075d4c000201a5d8108a6f596c9c4))
 
-Transfers stored on the CC account side (e.g. CC -> Checking) were excluded from the
+Transfers stored on the CC account side (e.g. Hilton -> DG Checking) were excluded from the
   day-by-day projection because the filter only checked account_id against monitored accounts. Now
   also includes transactions where transfer_account_id is a monitored account, with sign flipped to
   represent the checking account perspective.
@@ -136,7 +148,7 @@ Transfers stored on the CC account side (e.g. CC -> Checking) were excluded from
   ([`01108e9`](https://github.com/bakerboy448/YNAB-Balance-Monitor/commit/01108e92738e13c7b057f8352db6b2b096be9ea7))
 
 YNAB stores transfer records on either side of the transfer. The monitor only searched for
-  account_id=checking, missing transfers stored on the CC account side. Now checks
+  account_id=checking, missing transfers stored on the CC account side (e.g. Hilton). Now checks
   both directions.
 
 Also fixes display to use abs() for old amount and preserves the original account_id in PUT updates.
