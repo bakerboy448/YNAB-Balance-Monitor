@@ -971,6 +971,14 @@ def _build_notifiarr_update_payload(ctx):
         {"title": "Avg Daily Spend", "text": f"{daily_text} (13-mo avg)", "inline": True},
     ]
 
+    # CC payments — label each as scheduled or unscheduled
+    if ctx["cc_payments"]:
+        cc_lines = []
+        for p in ctx["cc_payments"].values():
+            tag = " *(scheduled)*" if p.get("scheduled") else " *(unscheduled)*"
+            cc_lines.append(f"{p['name']}: {_fmt_dollars(p['amount'])}{tag}")
+        fields.append({"title": "CC Payments", "text": "\n".join(cc_lines), "inline": False})
+
     return {
         "notification": {
             "update": True,
@@ -1082,8 +1090,14 @@ def send_update_notification(ctx):
         f"Avg daily spend: ${daily:,.0f}/day (13-mo avg)",
         f"Alert cushion: {_fmt_dollars(ctx['alert_threshold'])} (${daily:,.0f}/day x {ctx['alert_buffer_days']}d)",
         f"Target cushion: {_fmt_dollars(ctx['target_threshold'])} (${daily:,.0f}/day x {ctx['target_buffer_days']}d)",
-        f"Through {ctx['end_date'].strftime('%b %d, %Y')}",
     ]
+    if ctx["cc_payments"]:
+        lines.append("")
+        lines.append("CC payments:")
+        for p in ctx["cc_payments"].values():
+            tag = " (scheduled)" if p.get("scheduled") else " (unscheduled)"
+            lines.append(f"  {p['name']}: {_fmt_dollars(p['amount'])}{tag}")
+    lines.append(f"Through {ctx['end_date'].strftime('%b %d, %Y')}")
     message = "\n".join(lines)
 
     urls = UPDATE_APPRISE_URLS or APPRISE_URLS

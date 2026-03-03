@@ -67,6 +67,12 @@ def update_ctx_on_track():
         "target_buffer_days": 30,
         "avg_daily_expenses": 240,
         "buffer_days_remaining": 33.75,
+        "cc_payments": OrderedDict(
+            [
+                ("chase", {"name": "Chase Visa", "amount": -800, "scheduled": True}),
+                ("amex", {"name": "Amex Gold", "amount": -350, "scheduled": False}),
+            ]
+        ),
     }
 
 
@@ -84,6 +90,11 @@ def update_ctx_below_target():
         "target_buffer_days": 30,
         "avg_daily_expenses": 240,
         "buffer_days_remaining": 20.8,
+        "cc_payments": OrderedDict(
+            [
+                ("chase", {"name": "Chase Visa", "amount": -800, "scheduled": True}),
+            ]
+        ),
     }
 
 
@@ -101,6 +112,11 @@ def update_ctx_below_alert():
         "target_buffer_days": 30,
         "avg_daily_expenses": 240,
         "buffer_days_remaining": 12.9,
+        "cc_payments": OrderedDict(
+            [
+                ("chase", {"name": "Chase Visa", "amount": -800, "scheduled": True}),
+            ]
+        ),
     }
 
 
