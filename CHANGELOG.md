@@ -1,6 +1,18 @@
 # CHANGELOG
 
 
+## v1.2.0 (2026-03-03)
+
+### Chores
+
+- Add pre-commit hooks with PII detection, ruff, and secrets scanning
+  ([`ba8d035`](https://github.com/bakerboy448/YNAB-Balance-Monitor/commit/ba8d035932bbc55be336e9de542dfabb335fd571))
+
+Adds .pre-commit-config.yaml with: - Standard pre-commit-hooks (whitespace, yaml, merge conflict,
+  etc.) - Ruff linting and formatting - detect-secrets with baseline - shellcheck for shell scripts
+  - Custom PII pattern check to prevent account names/numbers in code
+
+
 ## v1.2.0-rc.5 (2026-03-03)
 
 ### Features
