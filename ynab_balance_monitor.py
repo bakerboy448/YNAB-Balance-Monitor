@@ -620,6 +620,9 @@ def project_minimum_balance(current_balance, scheduled_transactions, cc_payments
     CC payments with scheduled transfers (even beyond the projection window)
     are excluded from the day-1 lump sum. Only truly unscheduled CC payments
     are applied on day 1 as a conservative estimate.
+
+    Returns (min_balance, min_date, covered_cc_ids) where covered_cc_ids is
+    the set of CC account IDs that have scheduled transfers.
     """
     today = datetime.now().date()
 
@@ -661,7 +664,7 @@ def project_minimum_balance(current_balance, scheduled_transactions, cc_payments
         day += timedelta(days=1)
 
     print(f"\nProjected minimum balance: ${min_balance:,.2f} on {min_date}")
-    return min_balance, min_date
+    return min_balance, min_date, covered_cc_ids
 
 
 def calculate_monthly_expenses():
@@ -797,8 +800,14 @@ def _build_notification_context(
     avg_daily,
     transactions,
     cc_payments,
+    covered_cc_ids=None,
 ):
-    """Collect all notification data into a single context dict."""
+    """Collect all notification data into a single context dict.
+
+    covered_cc_ids: set of CC account IDs that have scheduled transfers.
+    These are excluded from cc_payments display since they already appear
+    as scheduled transactions in upcoming_outflows.
+    """
     shortfall = max(0, alert_threshold - min_balance)
     transfer_to_target = max(0, target_threshold - min_balance)
     buffer_days = min_balance / avg_daily if avg_daily > 0 else 0
@@ -810,6 +819,13 @@ def _build_notification_context(
         [t for t in transactions if today <= t["date"] <= week_out and t["amount"] < 0],
         key=lambda t: t["amount"],
     )[:5]
+
+    # Filter CC payments: only show unscheduled ones (covered CCs already
+    # appear as scheduled transfers in upcoming_outflows)
+    if covered_cc_ids:
+        unscheduled_cc = {cc_id: info for cc_id, info in cc_payments.items() if cc_id not in covered_cc_ids}
+    else:
+        unscheduled_cc = dict(cc_payments)
 
     return {
         "current_balance": balance,
@@ -826,7 +842,7 @@ def _build_notification_context(
         "shortfall": shortfall,
         "transfer_to_target": transfer_to_target,
         "upcoming_outflows": upcoming,
-        "cc_payments": cc_payments,
+        "cc_payments": unscheduled_cc,
     }
 
 
@@ -880,10 +896,10 @@ def _build_notifiarr_alert_payload(ctx):
             outflow_lines.append(f"{t['date'].strftime('%b %d')}: {t['payee']}  {_fmt_dollars(t['amount'])}")
         fields.append({"title": "Upcoming Bills", "text": "\n".join(outflow_lines), "inline": False})
 
-    # CC payments
+    # CC payments (only unscheduled — scheduled ones appear in Upcoming Bills)
     if ctx["cc_payments"]:
         cc_lines = [f"{p['name']}: {_fmt_dollars(p['amount'])}" for p in ctx["cc_payments"].values()]
-        fields.append({"title": "CC Payments Leaving Checking", "text": "\n".join(cc_lines), "inline": False})
+        fields.append({"title": "Unscheduled CC Payments", "text": "\n".join(cc_lines), "inline": False})
 
     # Action
     action = (
@@ -1009,7 +1025,7 @@ def send_alert_notification(ctx):
             lines.append(f"  {t['date'].strftime('%b %d')}: {t['payee']}  {_fmt_dollars(t['amount'])}")
     if ctx["cc_payments"]:
         lines.append("")
-        lines.append("CC payments leaving checking:")
+        lines.append("Unscheduled CC payments:")
         for p in ctx["cc_payments"].values():
             lines.append(f"  {p['name']}: {_fmt_dollars(p['amount'])}")
     lines.append("")
@@ -1152,7 +1168,7 @@ def run_check(send_update=False):
     print(f"Alert threshold ({YNAB_ALERT_BUFFER_DAYS}d): ${alert_threshold:,.0f}")
     print(f"Target threshold ({YNAB_TARGET_BUFFER_DAYS}d): ${target_threshold:,.0f}")
 
-    min_balance, min_date = project_minimum_balance(balance, transactions, cc_payments, end_date)
+    min_balance, min_date, covered_cc_ids = project_minimum_balance(balance, transactions, cc_payments, end_date)
 
     ctx = _build_notification_context(
         balance=balance,
@@ -1165,6 +1181,7 @@ def run_check(send_update=False):
         avg_daily=avg_daily,
         transactions=transactions,
         cc_payments=cc_payments,
+        covered_cc_ids=covered_cc_ids,
     )
 
     if min_balance < alert_threshold:
