@@ -320,7 +320,7 @@ def send_alert_notification(min_balance, min_date):
     )
 
     notifier = _build_notifier(APPRISE_URLS)
-    notify_type = apprise.NotifyType.WARNING if min_balance < 0 else apprise.NotifyType.INFO
+    notify_type = apprise.NotifyType.FAILURE if min_balance < 0 else apprise.NotifyType.WARNING
 
     if not notifier.notify(title=title, body=message, notify_type=notify_type):
         print("Failed to send alert via Apprise", file=sys.stderr)
