@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""YNAB Balance Monitor - Projects minimum checking account balance and alerts via Apprise."""
+"""YNAB Balance Monitor - Projects minimum account balances and alerts via Apprise."""
 
 import calendar
 import os
@@ -7,6 +7,7 @@ import signal
 import sys
 import json
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, date
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
@@ -19,10 +20,8 @@ import apprise
 
 YNAB_API_TOKEN = os.environ.get("YNAB_API_TOKEN", "")
 YNAB_BUDGET_ID = os.environ.get("YNAB_BUDGET_ID", "last-used")
-YNAB_ACCOUNT_ID = os.environ.get("YNAB_ACCOUNT_ID", "")
 YNAB_CC_CATEGORIES = os.environ.get("YNAB_CC_CATEGORIES", "")  # comma-separated IDs, empty = all
 MONITOR_DAYS = os.environ.get("MONITOR_DAYS", "")  # empty = end of current month
-MIN_BALANCE = int(os.environ.get("MIN_BALANCE", "0"))  # in dollars
 APPRISE_URLS = os.environ.get("APPRISE_URLS", "")  # comma-separated Apprise URLs
 SCHEDULE = os.environ.get("SCHEDULE", "")  # e.g. "08:00" for daily at 8am, "6h" for every 6 hours
 UPDATE_SCHEDULE = os.environ.get("UPDATE_SCHEDULE", "")  # when to send routine balance update notifications
@@ -30,6 +29,68 @@ UPDATE_APPRISE_URLS = os.environ.get("UPDATE_APPRISE_URLS", "")  # defaults to A
 TZ = os.environ.get("TZ", "")
 
 YNAB_BASE = "https://api.ynab.com/v1"
+
+
+@dataclass
+class AccountConfig:
+    account_id: str
+    min_balance: int
+    include_cc: bool
+    name: str = ""  # populated at runtime from YNAB API
+
+
+def parse_account_configs():
+    """Parse account configuration from environment variables.
+
+    New format (checked first):
+      YNAB_ACCOUNT_ID_CC=id:threshold,id2:threshold   (CC payments included)
+      YNAB_ACCOUNT_ID_NO_CC=id:threshold,id2           (CC payments excluded)
+      Threshold defaults to 0 if omitted.
+
+    Legacy format (fallback when new vars are not set):
+      YNAB_ACCOUNT_ID=id  +  MIN_BALANCE=threshold     (CC payments included)
+    """
+    cc_raw = os.environ.get("YNAB_ACCOUNT_ID_CC", "").strip()
+    no_cc_raw = os.environ.get("YNAB_ACCOUNT_ID_NO_CC", "").strip()
+    legacy_raw = os.environ.get("YNAB_ACCOUNT_ID", "").strip()
+
+    new_set = bool(cc_raw or no_cc_raw)
+    old_set = bool(legacy_raw)
+
+    if old_set and new_set:
+        print("Error: Cannot use YNAB_ACCOUNT_ID alongside YNAB_ACCOUNT_ID_CC/YNAB_ACCOUNT_ID_NO_CC",
+              file=sys.stderr)
+        sys.exit(1)
+
+    if new_set:
+        accounts = []
+        for entry in _parse_account_entries(cc_raw):
+            accounts.append(AccountConfig(account_id=entry[0], min_balance=entry[1], include_cc=True))
+        for entry in _parse_account_entries(no_cc_raw):
+            accounts.append(AccountConfig(account_id=entry[0], min_balance=entry[1], include_cc=False))
+        return accounts
+
+    if old_set:
+        min_bal = int(os.environ.get("MIN_BALANCE", "0"))
+        return [AccountConfig(account_id=legacy_raw, min_balance=min_bal, include_cc=True)]
+
+    return []
+
+
+def _parse_account_entries(raw):
+    """Parse 'id:threshold,id2:threshold,...' into list of (account_id, min_balance) tuples."""
+    entries = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            acct_id, threshold = part.split(":", 1)
+            entries.append((acct_id.strip(), int(threshold.strip())))
+        else:
+            entries.append((part, 0))
+    return entries
+
 
 # ---------------------------------------------------------------------------
 # YNAB API helpers
@@ -73,14 +134,14 @@ def get_end_date():
     return date(today.year, today.month, last_day)
 
 
-def get_account_balance():
-    """Get the current balance of the monitored account."""
-    data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts/{YNAB_ACCOUNT_ID}")
+def get_account_balance(account_id):
+    """Get the current balance and name of the given account."""
+    data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts/{account_id}")
     account = data["account"]
     balance = milliunits_to_dollars(account["balance"])
     print(f"Account: {account['name']}")
     print(f"Current balance: ${balance:,.2f}")
-    return balance
+    return balance, account["name"]
 
 
 def _add_months(d, months):
@@ -155,18 +216,24 @@ def _expand_occurrences(next_date, frequency, start, end):
     return dates
 
 
-def get_scheduled_transactions(end_date):
-    """Get all scheduled transactions for the monitored account.
-
-    Expands recurring transactions into individual occurrences within the
-    monitoring window.
-    """
+def fetch_all_scheduled_transactions():
+    """Fetch all scheduled transactions from the budget (single API call)."""
     data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions")
+    return data["scheduled_transactions"]
+
+
+def get_scheduled_transactions(all_scheduled, account_id, end_date):
+    """Filter and expand scheduled transactions for one account.
+
+    all_scheduled: raw list from fetch_all_scheduled_transactions()
+    account_id: the account to filter for
+    end_date: projection end date
+    """
     today = datetime.now().date()
 
     transactions = []
-    for txn in data["scheduled_transactions"]:
-        if txn["account_id"] != YNAB_ACCOUNT_ID:
+    for txn in all_scheduled:
+        if txn["account_id"] != account_id:
             continue
         if txn.get("deleted", False):
             continue
@@ -196,11 +263,11 @@ def get_scheduled_transactions(end_date):
     return transactions
 
 
-def get_cc_payment_amounts():
+def get_cc_payment_amounts(cc_categories_filter=""):
     """Get credit card payment category available balances.
 
-    Returns a dict of {account_id: available_amount} for credit card accounts,
-    and the total amount to be paid.
+    cc_categories_filter: comma-separated category IDs/names, or empty for all.
+    Returns a dict of {account_id: {name, amount}} and the total amount.
     """
     # Get all accounts to identify credit card accounts and map category names
     accounts_data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts")
@@ -214,8 +281,8 @@ def get_cc_payment_amounts():
 
     # Parse user-specified CC categories filter
     cc_filter = set()
-    if YNAB_CC_CATEGORIES:
-        cc_filter = {c.strip() for c in YNAB_CC_CATEGORIES.split(",")}
+    if cc_categories_filter:
+        cc_filter = {c.strip() for c in cc_categories_filter.split(",")}
 
     cc_payments = {}
     for group in categories_data["category_groups"]:
@@ -310,13 +377,13 @@ def _build_notifier(urls_str):
     return notifier
 
 
-def send_alert_notification(min_balance, min_date):
+def send_alert_notification(min_balance, min_date, account_name, min_threshold):
     """Send a below-threshold alert via Apprise."""
     title = "YNAB Balance Alert"
     message = (
-        f"Your checking account balance is projected to drop to "
+        f"Your {account_name} balance is projected to drop to "
         f"${min_balance:,.2f} by {min_date.strftime('%b %d, %Y')}. "
-        f"Minimum threshold: ${MIN_BALANCE:,.2f}."
+        f"Minimum threshold: ${min_threshold:,.2f}."
     )
 
     notifier = _build_notifier(APPRISE_URLS)
@@ -328,19 +395,19 @@ def send_alert_notification(min_balance, min_date):
         print("\nAlert notification sent via Apprise")
 
 
-def send_update_notification(min_balance, min_date, end_date):
+def send_update_notification(min_balance, min_date, end_date, account_name, min_threshold):
     """Send a routine projected-balance update via Apprise."""
     title = "YNAB Balance Update"
-    status = "below threshold" if min_balance < MIN_BALANCE else "on track"
+    status = "below threshold" if min_balance < min_threshold else "on track"
     message = (
-        f"Projected minimum: ${min_balance:,.2f} on {min_date.strftime('%b %d')} "
+        f"{account_name} projected minimum: ${min_balance:,.2f} on {min_date.strftime('%b %d')} "
         f"(through {end_date.strftime('%b %d, %Y')}). "
-        f"Threshold: ${MIN_BALANCE:,.2f} — {status}."
+        f"Threshold: ${min_threshold:,.2f} — {status}."
     )
 
     urls = UPDATE_APPRISE_URLS or APPRISE_URLS
     notifier = _build_notifier(urls)
-    notify_type = apprise.NotifyType.WARNING if min_balance < MIN_BALANCE else apprise.NotifyType.SUCCESS
+    notify_type = apprise.NotifyType.WARNING if min_balance < min_threshold else apprise.NotifyType.SUCCESS
 
     if not notifier.notify(title=title, body=message, notify_type=notify_type):
         print("Failed to send update notification via Apprise", file=sys.stderr)
@@ -352,13 +419,15 @@ def send_update_notification(min_balance, min_date, end_date):
 # Main
 # ---------------------------------------------------------------------------
 
-def validate_config():
+def validate_config(accounts):
     """Check required configuration is present."""
     errors = []
     if not YNAB_API_TOKEN:
         errors.append("YNAB_API_TOKEN is required")
-    if not YNAB_ACCOUNT_ID:
-        errors.append("YNAB_ACCOUNT_ID is required")
+    if not accounts:
+        errors.append(
+            "No accounts configured. Set YNAB_ACCOUNT_ID_CC, YNAB_ACCOUNT_ID_NO_CC, or YNAB_ACCOUNT_ID"
+        )
     if not APPRISE_URLS:
         errors.append("APPRISE_URLS is required")
     if errors:
@@ -367,34 +436,50 @@ def validate_config():
         sys.exit(1)
 
 
-def run_check(send_update=False):
-    """Run one balance check cycle.
+def run_cycle(accounts, send_update=False):
+    """Run one balance check cycle for all accounts.
 
-    Always evaluates the alert threshold and fires an alert notification if
-    the projected minimum falls below MIN_BALANCE.  When send_update is True,
-    also fires a routine update notification regardless of the threshold.
+    Fetches budget-wide data once, then checks each account.
     """
     end_date = get_end_date()
 
     print("=" * 60)
     print(f"YNAB Balance Monitor — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f"Projecting through {end_date}, threshold: ${MIN_BALANCE:,.2f}")
+    print(f"Projecting through {end_date}, {len(accounts)} account(s)")
     print("=" * 60)
 
-    balance = get_account_balance()
-    transactions = get_scheduled_transactions(end_date)
-    cc_payments, cc_total = get_cc_payment_amounts()
-    min_balance, min_date = project_minimum_balance(balance, transactions, cc_payments, end_date)
+    # Budget-wide fetches (done once per cycle)
+    all_scheduled = fetch_all_scheduled_transactions()
 
-    if min_balance < MIN_BALANCE:
-        shortfall = MIN_BALANCE - min_balance
-        print(f"\n⚠ ALERT: Projected balance drops ${shortfall:,.2f} below threshold!")
-        send_alert_notification(min_balance, min_date)
+    need_cc = any(a.include_cc for a in accounts)
+    if need_cc:
+        cc_payments, cc_total = get_cc_payment_amounts(YNAB_CC_CATEGORIES)
     else:
-        print(f"\n✓ Balance stays above ${MIN_BALANCE:,.2f} threshold.")
+        cc_payments, cc_total = {}, 0
 
-    if send_update:
-        send_update_notification(min_balance, min_date, end_date)
+    for acct in accounts:
+        print(f"\n{'—' * 40}")
+        balance, name = get_account_balance(acct.account_id)
+        acct.name = name
+
+        transactions = get_scheduled_transactions(all_scheduled, acct.account_id, end_date)
+
+        if acct.include_cc:
+            acct_cc = cc_payments
+        else:
+            acct_cc = {}
+
+        min_balance, min_date = project_minimum_balance(balance, transactions, acct_cc, end_date)
+
+        if min_balance < acct.min_balance:
+            shortfall = acct.min_balance - min_balance
+            print(f"\n⚠ ALERT: {name} projected balance drops ${shortfall:,.2f} below threshold!")
+            send_alert_notification(min_balance, min_date, name, acct.min_balance)
+        else:
+            print(f"\n✓ {name} stays above ${acct.min_balance:,.2f} threshold.")
+
+        if send_update:
+            send_update_notification(min_balance, min_date, end_date, name, acct.min_balance)
 
 
 # ---------------------------------------------------------------------------
@@ -457,14 +542,15 @@ def _describe_schedule(label, parsed):
 
 
 def main():
-    validate_config()
+    accounts = parse_account_configs()
+    validate_config(accounts)
 
     schedule = _parse_schedule(SCHEDULE)
     update_schedule = _parse_schedule(UPDATE_SCHEDULE) if UPDATE_SCHEDULE else None
 
     if schedule is None and update_schedule is None:
         # Run once and exit
-        run_check()
+        run_cycle(accounts)
         return
 
     # Run on a schedule (at least one of check / update is recurring)
@@ -519,7 +605,7 @@ def main():
         # Run the projection (always checks alert threshold; optionally sends
         # an update notification when the update schedule fires, or on every
         # check when no separate UPDATE_SCHEDULE is configured).
-        run_check(send_update=do_update or (do_check and update_schedule is None))
+        run_cycle(accounts, send_update=do_update or (do_check and update_schedule is None))
 
         if do_check and schedule:
             next_check = _next_occurrence(schedule)
