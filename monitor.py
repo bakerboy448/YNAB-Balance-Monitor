@@ -2,6 +2,7 @@
 """YNAB Balance Monitor - Projects minimum account balances and alerts via Apprise."""
 
 import calendar
+import logging
 import os
 import signal
 import sys
@@ -13,6 +14,11 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
 import apprise
+
+# Surface Apprise's internal errors (network failures, auth errors, etc.)
+logging.basicConfig(stream=sys.stderr, level=logging.WARNING,
+                    format="%(name)s: %(message)s")
+logging.getLogger("apprise").setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -373,8 +379,31 @@ def _build_notifier(urls_str):
     for url in urls_str.split(","):
         url = url.strip()
         if url:
-            notifier.add(url)
+            if not notifier.add(url):
+                print(f"Apprise: failed to load URL: {url[:40]}...", file=sys.stderr)
     return notifier
+
+
+def _send_notification(urls_str, title, message, notify_type):
+    """Send a notification via Apprise with retry logic.
+
+    Returns True on success, False on failure.
+    """
+    notifier = _build_notifier(urls_str)
+    if len(notifier) == 0:
+        print("Apprise: no valid notification URLs loaded", file=sys.stderr)
+        return False
+
+    for attempt in range(2):
+        result = notifier.notify(title=title, body=message, notify_type=notify_type)
+        if result is True:
+            return True
+        if attempt == 0:
+            print("Apprise: notification failed, retrying in 5s...", file=sys.stderr)
+            time.sleep(5)
+
+    print("Apprise: notification failed after retry", file=sys.stderr)
+    return False
 
 
 def send_alert_notification(min_balance, min_date, account_name, min_threshold):
@@ -386,12 +415,9 @@ def send_alert_notification(min_balance, min_date, account_name, min_threshold):
         f"Minimum threshold: ${min_threshold:,.2f}."
     )
 
-    notifier = _build_notifier(APPRISE_URLS)
     notify_type = apprise.NotifyType.FAILURE if min_balance < 0 else apprise.NotifyType.WARNING
 
-    if not notifier.notify(title=title, body=message, notify_type=notify_type):
-        print("Failed to send alert via Apprise", file=sys.stderr)
-    else:
+    if _send_notification(APPRISE_URLS, title, message, notify_type):
         print("\nAlert notification sent via Apprise")
 
 
@@ -406,12 +432,9 @@ def send_update_notification(min_balance, min_date, end_date, account_name, min_
     )
 
     urls = UPDATE_APPRISE_URLS or APPRISE_URLS
-    notifier = _build_notifier(urls)
     notify_type = apprise.NotifyType.WARNING if min_balance < min_threshold else apprise.NotifyType.SUCCESS
 
-    if not notifier.notify(title=title, body=message, notify_type=notify_type):
-        print("Failed to send update notification via Apprise", file=sys.stderr)
-    else:
+    if _send_notification(urls, title, message, notify_type):
         print("\nUpdate notification sent via Apprise")
 
 
