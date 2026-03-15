@@ -42,14 +42,24 @@ DRY_RUN = os.environ.get("DRY_RUN", "").lower() in ("true", "1", "yes")
 
 YNAB_BASE = "https://api.ynab.com/v1"
 YNAB_API_TIMEOUT = 30  # seconds
+CACHE_DIR = os.environ.get("CACHE_DIR", "/tmp/ynab-monitor")
 
 APP_NAME = "YNAB Monitor"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 USER_AGENT = f"YNAB-Balance-Monitor/{APP_VERSION} (+https://github.com/bakerboy448/YNAB-Balance-Monitor)"
+
+# Retry configuration
+_RETRY_MAX = 3
+_RETRY_BACKOFFS = [30, 60, 120]  # seconds
+
 
 # ---------------------------------------------------------------------------
 # YNAB API helpers
 # ---------------------------------------------------------------------------
+
+
+class YNABAPIError(Exception):
+    """Raised when the YNAB API request fails after all retries."""
 
 
 def _sanitize_error(body, max_length=500):
@@ -65,69 +75,126 @@ def _sanitize_error(body, max_length=500):
     return text
 
 
+def _ynab_request(method, path, payload=None):
+    """Make an authenticated request to the YNAB API with retry and backoff.
+
+    Retries on 5xx, network errors, and timeouts with exponential backoff.
+    Honors Retry-After header on 429. Fails immediately on 401/403.
+    Raises YNABAPIError after exhausting retries.
+    """
+
+    url = f"{YNAB_BASE}{path}"
+    headers = {
+        "Authorization": f"Bearer {YNAB_API_TOKEN}",
+        "User-Agent": USER_AGENT,
+    }
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+
+    last_exc = None
+    for attempt in range(_RETRY_MAX):
+        data = json.dumps(payload).encode() if payload is not None else None
+        req = Request(url, data=data, method=method, headers=headers)
+        try:
+            with urlopen(req, timeout=YNAB_API_TIMEOUT) as resp:
+                return json.loads(resp.read().decode())["data"]
+        except HTTPError as e:
+            body = e.read().decode()
+            code = e.code
+
+            # Auth errors — fail immediately
+            if code in (401, 403):
+                raise YNABAPIError(f"YNAB API auth error ({code}): {_sanitize_error(body)}") from e
+
+            # Rate limit — honor Retry-After
+            if code == 429:
+                retry_after = int(e.headers.get("Retry-After", _RETRY_BACKOFFS[attempt]))
+                print(f"YNAB API rate limited, waiting {retry_after}s (attempt {attempt + 1}/{_RETRY_MAX})")
+                time.sleep(retry_after)
+                last_exc = e
+                continue
+
+            # Server errors — retry with backoff
+            if code >= 500:
+                wait = _RETRY_BACKOFFS[attempt]
+                print(f"YNAB API error ({code}), retrying in {wait}s (attempt {attempt + 1}/{_RETRY_MAX})")
+                time.sleep(wait)
+                last_exc = e
+                continue
+
+            # Other client errors — fail immediately
+            raise YNABAPIError(f"YNAB API error ({code}): {_sanitize_error(body)}") from e
+
+        except (URLError, TimeoutError, OSError) as e:
+            wait = _RETRY_BACKOFFS[attempt]
+            print(f"Network error: {e}, retrying in {wait}s (attempt {attempt + 1}/{_RETRY_MAX})")
+            time.sleep(wait)
+            last_exc = e
+
+    raise YNABAPIError(f"YNAB API request failed after {_RETRY_MAX} attempts: {last_exc}") from last_exc
+
+
 def ynab_get(path):
     """Make an authenticated GET request to the YNAB API."""
-    url = f"{YNAB_BASE}{path}"
-    req = Request(url, headers={"Authorization": f"Bearer {YNAB_API_TOKEN}", "User-Agent": USER_AGENT})
-    try:
-        with urlopen(req, timeout=YNAB_API_TIMEOUT) as resp:
-            return json.loads(resp.read().decode())["data"]
-    except HTTPError as e:
-        body = e.read().decode()
-        print(f"YNAB API error ({e.code}): {_sanitize_error(body)}", file=sys.stderr)
-        sys.exit(1)
-    except URLError as e:
-        print(f"Network error: {e.reason}", file=sys.stderr)
-        sys.exit(1)
-    except TimeoutError:
-        print(f"Timeout connecting to YNAB API ({YNAB_API_TIMEOUT}s)", file=sys.stderr)
-        sys.exit(1)
+    return _ynab_request("GET", path)
 
 
 def ynab_put(path, payload):
     """Make an authenticated PUT request to the YNAB API."""
-    url = f"{YNAB_BASE}{path}"
-    data = json.dumps(payload).encode()
-    req = Request(
-        url,
-        data=data,
-        method="PUT",
-        headers={
-            "Authorization": f"Bearer {YNAB_API_TOKEN}",
-            "Content-Type": "application/json",
-            "User-Agent": USER_AGENT,
-        },
-    )
-    try:
-        with urlopen(req, timeout=YNAB_API_TIMEOUT) as resp:
-            return json.loads(resp.read().decode())["data"]
-    except HTTPError as e:
-        body = e.read().decode()
-        print(f"YNAB API PUT error ({e.code}): {_sanitize_error(body)}", file=sys.stderr)
-        raise
+    return _ynab_request("PUT", path, payload)
 
 
 def ynab_post(path, payload):
     """Make an authenticated POST request to the YNAB API."""
-    url = f"{YNAB_BASE}{path}"
-    data = json.dumps(payload).encode()
-    req = Request(
-        url,
-        data=data,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {YNAB_API_TOKEN}",
-            "Content-Type": "application/json",
-            "User-Agent": USER_AGENT,
-        },
-    )
+    return _ynab_request("POST", path, payload)
+
+
+# ---------------------------------------------------------------------------
+# Disk caching helpers
+# ---------------------------------------------------------------------------
+
+
+def _cache_path(name):
+    """Return a cache file path, ensuring the directory exists."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    return os.path.join(CACHE_DIR, name)
+
+
+def _read_cache(filepath, ttl_seconds):
+    """Read JSON from a cache file if it exists and is within TTL.
+
+    Returns None if the cache is missing, expired, or corrupt.
+    Uses file locking for shared cache safety.
+    """
+    import fcntl
+
     try:
-        with urlopen(req, timeout=YNAB_API_TIMEOUT) as resp:
-            return json.loads(resp.read().decode())["data"]
-    except HTTPError as e:
-        body = e.read().decode()
-        print(f"YNAB API POST error ({e.code}): {_sanitize_error(body)}", file=sys.stderr)
-        raise
+        with open(filepath) as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            try:
+                data = json.load(f)
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+        cached_at = data.get("cached_at", 0)
+        if time.time() - cached_at > ttl_seconds:
+            return None
+        return data
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        return None
+
+
+def _write_cache(filepath, data):
+    """Write JSON data to a cache file with file locking."""
+    import fcntl
+
+    data = {**data, "cached_at": time.time()}
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            json.dump(data, f)
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def milliunits_to_dollars(milliunits):
@@ -184,14 +251,30 @@ def get_end_date():
     return date(today.year, today.month, last_day)
 
 
-def get_account_balances():
+def get_account_balances(all_accounts=None):
     """Get current balances for all monitored accounts.
 
     Returns tuple of (total_balance, list of account details).
-    Supports single account or multiple comma-separated accounts.
+    If all_accounts is provided (list of account dicts from /accounts),
+    uses it instead of per-account API calls.
     """
     total_balance = 0.0
     accounts = []
+
+    if all_accounts is not None:
+        acct_map = {a["id"]: a for a in all_accounts}
+        for account_id in YNAB_ACCOUNT_IDS:
+            account = acct_map.get(account_id)
+            if not account:
+                raise YNABAPIError(f"Account {account_id} not found in budget")
+            balance = milliunits_to_dollars(account["balance"])
+            accounts.append({"id": account_id, "name": account["name"], "balance": balance})
+            total_balance += balance
+            print(f"Account: {account['name']}")
+            print(f"  Balance: ${balance:,.2f}")
+        if len(accounts) > 1:
+            print(f"Combined balance: ${total_balance:,.2f}")
+        return total_balance, accounts
 
     for account_id in YNAB_ACCOUNT_IDS:
         data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts/{account_id}")
@@ -286,17 +369,20 @@ def _expand_occurrences(next_date, frequency, start, end):
     return dates
 
 
-def get_scheduled_transactions(end_date):
+def get_scheduled_transactions(end_date, raw_scheduled=None):
     """Get all scheduled transactions for the monitored account.
 
     Expands recurring transactions into individual occurrences within the
-    monitoring window.
+    monitoring window. If raw_scheduled is provided, uses it instead of
+    fetching from the API.
     """
-    data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions")
+    if raw_scheduled is None:
+        data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions")
+        raw_scheduled = data["scheduled_transactions"]
     today = datetime.now().date()
 
     transactions = []
-    for txn in data["scheduled_transactions"]:
+    for txn in raw_scheduled:
         if txn.get("deleted", False):
             continue
 
@@ -388,7 +474,7 @@ def _compute_statement_balance(account_id, cleared_balance_milliunits, close_day
     return payment_dollars, last_close
 
 
-def get_cc_payment_amounts():
+def get_cc_payment_amounts(all_accounts=None):
     """Get credit card payment amounts.
 
     For cards with configured close dates in YNAB_CC_CLOSE_DATES: computes
@@ -396,15 +482,18 @@ def get_cc_payment_amounts():
     post-close transactions from cleared_balance.
     For cards without: falls back to category balance (original behavior).
 
+    If all_accounts is provided, uses it instead of fetching from the API.
     Returns a dict of {account_id: {name, amount}} and the total.
     """
     close_dates = parse_cc_close_dates()
 
     # Get all accounts to identify CC accounts and their cleared balances
-    accounts_data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts")
+    if all_accounts is None:
+        accounts_data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts")
+        all_accounts = accounts_data["accounts"]
     cc_accounts = {}  # name -> id
     cc_cleared = {}  # id -> {name, cleared_balance_milliunits}
-    for acct in accounts_data["accounts"]:
+    for acct in all_accounts:
         if acct["type"] == "creditCard" and not acct.get("deleted", False) and not acct.get("closed", False):
             cc_accounts[acct["name"]] = acct["id"]
             cc_cleared[acct["id"]] = {
@@ -430,6 +519,13 @@ def get_cc_payment_amounts():
             }
 
     # Cards WITHOUT close dates: fall back to category balance
+    # Only fetch categories if there are CC accounts not yet covered by close dates
+    uncovered_cc = {name: aid for name, aid in cc_accounts.items() if aid not in cc_payments}
+    if not uncovered_cc:
+        total = sum(p["amount"] for p in cc_payments.values())
+        print(f"\nCredit card payments to account for: ${total:,.2f}")
+        return cc_payments, total
+
     cc_filter = set()
     if YNAB_CC_CATEGORIES:
         cc_filter = {c.strip() for c in YNAB_CC_CATEGORIES.split(",")}
@@ -489,19 +585,22 @@ def get_cc_payment_history(cc_account_id, months_back=6):
     return Counter(pay_days).most_common(1)[0][0]
 
 
-def update_cc_payment_amount(cc_account_id, cc_name, payment_amount, checking_account_id):
+def update_cc_payment_amount(cc_account_id, cc_name, payment_amount, checking_account_id, raw_scheduled=None):
     """Update the scheduled payment amount for a CC if it differs.
 
     Finds existing scheduled transfer from checking to this CC.
     If found and amount differs: PUT update.
     If not found and YNAB_CC_CREATE_PAYMENTS is enabled: create using
     historical pay date analysis. Otherwise: log warning and skip.
+    If raw_scheduled is provided, uses it instead of fetching from the API.
     """
-    data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions")
+    if raw_scheduled is None:
+        data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions")
+        raw_scheduled = data["scheduled_transactions"]
 
     existing = None
     reverse = False
-    for txn in data["scheduled_transactions"]:
+    for txn in raw_scheduled:
         if txn.get("deleted"):
             continue
         # Find transfer between checking and this CC (either direction)
@@ -590,15 +689,15 @@ def update_cc_payment_amount(cc_account_id, cc_name, payment_amount, checking_ac
             print(f"  Warning: no scheduled payment found for {cc_name}, skipping")
 
 
-def _get_all_cc_transfer_ids():
-    """Fetch all scheduled CC transfer account IDs (regardless of date).
+def get_covered_cc_ids(raw_scheduled):
+    """Get all scheduled CC transfer account IDs (regardless of date).
 
     Returns a set of CC account IDs that have a scheduled transfer
     from/to any monitored checking account.
+    raw_scheduled: list of scheduled transaction dicts from the API.
     """
-    data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions")
     covered = set()
-    for txn in data["scheduled_transactions"]:
+    for txn in raw_scheduled:
         if txn.get("deleted"):
             continue
         acct = txn["account_id"]
@@ -614,7 +713,7 @@ def _get_all_cc_transfer_ids():
     return covered
 
 
-def project_minimum_balance(current_balance, scheduled_transactions, cc_payments, end_date):
+def project_minimum_balance(current_balance, scheduled_transactions, cc_payments, end_date, covered_cc_ids=None):
     """Walk day-by-day to find the minimum projected balance.
 
     CC payments with scheduled transfers (even beyond the projection window)
@@ -626,8 +725,8 @@ def project_minimum_balance(current_balance, scheduled_transactions, cc_payments
     """
     today = datetime.now().date()
 
-    # Identify CC accounts that have ANY scheduled transfer (regardless of date)
-    covered_cc_ids = _get_all_cc_transfer_ids()
+    if covered_cc_ids is None:
+        covered_cc_ids = set()
 
     # Remove covered CC payments; also dedup against in-window transfers
     remaining_cc = {}
@@ -670,13 +769,26 @@ def project_minimum_balance(current_balance, scheduled_transactions, cc_payments
 def calculate_monthly_expenses():
     """Calculate average monthly expenses from trailing 13 months of YNAB data.
 
-    Fetches MonthDetail for each of the last 13 complete months, sums negative
-    category activity (excluding CC payment and internal categories), and
-    returns the average.  13 months captures seasonal variation and ensures
-    every calendar month is represented at least once.
+    Uses disk cache (24h TTL) to avoid 13 sequential API calls on every run.
+    --dry-run always fetches fresh data. Cache is stored per budget ID.
 
     Returns (avg_daily_expenses, avg_monthly_expenses).
     """
+    cache_file = _cache_path(f"monthly_expenses_{YNAB_BUDGET_ID}.json")
+    cache_ttl = 86400  # 24 hours
+
+    if not DRY_RUN:
+        cached = _read_cache(cache_file, cache_ttl)
+        if cached and "monthly_totals" in cached:
+            monthly_totals = [(date.fromisoformat(m), t) for m, t in cached["monthly_totals"]]
+            avg_monthly = sum(t for _, t in monthly_totals) / len(monthly_totals)
+            avg_daily = avg_monthly / 30.44
+            print("\nTrailing 13-month expenses (cached):")
+            for month_start, total in monthly_totals:
+                print(f"  {month_start.strftime('%b %Y'):>10s}  ${total:>10,.2f}")
+            print(f"  {'Average':>10s}  ${avg_monthly:>10,.2f}/mo  (${avg_daily:,.2f}/day)")
+            return avg_daily, avg_monthly
+
     today = datetime.now().date()
     first_of_month = date(today.year, today.month, 1)
     skip_groups = {"Credit Card Payments", "Internal Master Category"}
@@ -700,6 +812,14 @@ def calculate_monthly_expenses():
 
         monthly_totals.append((month_start, total))
 
+    # Write cache
+    _write_cache(
+        cache_file,
+        {
+            "monthly_totals": [(m.isoformat(), t) for m, t in monthly_totals],
+        },
+    )
+
     avg_monthly = sum(t for _, t in monthly_totals) / len(monthly_totals)
     avg_daily = avg_monthly / 30.44  # average days per month
 
@@ -709,6 +829,64 @@ def calculate_monthly_expenses():
     print(f"  {'Average':>10s}  ${avg_monthly:>10,.2f}/mo  (${avg_daily:,.2f}/day)")
 
     return avg_daily, avg_monthly
+
+
+def fetch_scheduled_transactions_delta():
+    """Fetch scheduled transactions using delta sync (last_knowledge_of_server).
+
+    On first call: full fetch, caches response + server_knowledge.
+    On subsequent calls: sends ?last_knowledge_of_server=N, merges delta.
+    Returns the full list of scheduled transaction dicts.
+    """
+    cache_file = _cache_path(f"delta_scheduled_{YNAB_BUDGET_ID}.json")
+    cached = _read_cache(cache_file, 86400 * 7)  # 7-day max TTL for delta base
+
+    if cached and "server_knowledge" in cached and "transactions" in cached:
+        sk = cached["server_knowledge"]
+        try:
+            data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions?last_knowledge_of_server={sk}")
+        except YNABAPIError:
+            # Delta failed — do a full fetch
+            data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions")
+            _write_cache(
+                cache_file,
+                {
+                    "server_knowledge": data.get("server_knowledge", 0),
+                    "transactions": data["scheduled_transactions"],
+                },
+            )
+            return data["scheduled_transactions"]
+
+        # Merge delta into cached transactions
+        txn_map = {t["id"]: t for t in cached["transactions"]}
+        for txn in data.get("scheduled_transactions", []):
+            if txn.get("deleted"):
+                txn_map.pop(txn["id"], None)
+            else:
+                txn_map[txn["id"]] = txn
+
+        merged = list(txn_map.values())
+        _write_cache(
+            cache_file,
+            {
+                "server_knowledge": data.get("server_knowledge", sk),
+                "transactions": merged,
+            },
+        )
+        print(f"  Scheduled transactions: delta sync (knowledge {sk} → {data.get('server_knowledge', sk)})")
+        return merged
+
+    # First run / cache miss — full fetch
+    data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions")
+    _write_cache(
+        cache_file,
+        {
+            "server_knowledge": data.get("server_knowledge", 0),
+            "transactions": data["scheduled_transactions"],
+        },
+    )
+    print("  Scheduled transactions: full fetch (no delta cache)")
+    return data["scheduled_transactions"]
 
 
 def get_dynamic_thresholds(avg_daily_expenses):
@@ -1203,9 +1381,9 @@ def validate_config():
 def run_check(send_update=False):
     """Run one balance check cycle.
 
-    Computes dynamic alert/target thresholds from monthly outflows and fires
-    an alert if the projected minimum falls below the alert threshold.
-    When send_update is True, also fires a routine update notification.
+    Fetches accounts and scheduled transactions once and passes them through
+    to avoid duplicate API calls. Uses delta sync for scheduled transactions
+    and disk cache for monthly expenses.
     """
     end_date = get_end_date()
 
@@ -1214,9 +1392,14 @@ def run_check(send_update=False):
     print(f"Projecting through {end_date}, min floor: ${MIN_BALANCE:,.2f}")
     print("=" * 60)
 
-    balance, accounts = get_account_balances()
-    transactions = get_scheduled_transactions(end_date)
-    cc_payments, _ = get_cc_payment_amounts()
+    # Fetch shared data once
+    accounts_data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts")
+    all_accounts = accounts_data["accounts"]
+    raw_scheduled = fetch_scheduled_transactions_delta()
+
+    balance, accounts = get_account_balances(all_accounts=all_accounts)
+    transactions = get_scheduled_transactions(end_date, raw_scheduled=raw_scheduled)
+    cc_payments, _ = get_cc_payment_amounts(all_accounts=all_accounts)
 
     # Update CC scheduled payment amounts
     if YNAB_ACCOUNT_IDS:
@@ -1224,7 +1407,13 @@ def run_check(send_update=False):
         checking_id = YNAB_ACCOUNT_IDS[0]  # Primary checking account
         for cc_id, payment_info in cc_payments.items():
             if payment_info["amount"] > 0:
-                update_cc_payment_amount(cc_id, payment_info["name"], payment_info["amount"], checking_id)
+                update_cc_payment_amount(
+                    cc_id,
+                    payment_info["name"],
+                    payment_info["amount"],
+                    checking_id,
+                    raw_scheduled=raw_scheduled,
+                )
 
     # Calculate dynamic thresholds based on last month's actual expenses
     avg_daily, avg_monthly = calculate_monthly_expenses()
@@ -1232,7 +1421,14 @@ def run_check(send_update=False):
     print(f"Alert threshold ({YNAB_ALERT_BUFFER_DAYS}d): ${alert_threshold:,.0f}")
     print(f"Target threshold ({YNAB_TARGET_BUFFER_DAYS}d): ${target_threshold:,.0f}")
 
-    min_balance, min_date, covered_cc_ids = project_minimum_balance(balance, transactions, cc_payments, end_date)
+    covered_cc_ids = get_covered_cc_ids(raw_scheduled)
+    min_balance, min_date, covered_cc_ids = project_minimum_balance(
+        balance,
+        transactions,
+        cc_payments,
+        end_date,
+        covered_cc_ids=covered_cc_ids,
+    )
 
     ctx = _build_notification_context(
         balance=balance,
@@ -1381,7 +1577,13 @@ def main():
 
         # Run the projection (always checks alert threshold; optionally sends
         # an update notification when the update schedule fires).
-        run_check(send_update=do_update)
+        # Catch transient errors so the daemon keeps running.
+        try:
+            run_check(send_update=do_update)
+        except YNABAPIError as e:
+            print(f"\nCheck failed (will retry on next schedule): {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"\nUnexpected error (will retry on next schedule): {e}", file=sys.stderr)
 
         if do_check and schedule:
             next_check = _next_occurrence(schedule)

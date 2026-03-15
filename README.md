@@ -9,15 +9,16 @@ Useful for keeping most of your cash in a high-yield savings account while makin
 
 ## How it works
 
-1. Fetches the current cleared balance of your checking account(s) — supports monitoring multiple accounts
-2. Fetches all scheduled transactions for those accounts within the projection window
-3. Computes **statement balances** for each credit card using configured close dates — this is the balance at the last statement close, not the current balance
+1. Fetches accounts and scheduled transactions once per cycle (shared across all checks)
+2. Uses **delta sync** (`last_knowledge_of_server`) for scheduled transactions — only fetches changes since last run
+3. Computes **statement balances** for each credit card using configured close dates
 4. Searches for existing CC payment transfers **bidirectionally** — YNAB may store the transfer on either the checking or credit card side
 5. Updates scheduled CC payment amounts if they don't match the statement balance
 6. Deduplicates — CC payments with scheduled transfers aren't double-counted as unscheduled
 7. Walks day-by-day to find the **minimum projected balance**
-8. Compares the minimum against **dynamic thresholds** based on trailing average daily expenses
+8. Compares the minimum against **dynamic thresholds** based on trailing average daily expenses (cached 24h)
 9. If it drops below the alert threshold, sends a notification
+10. **Retries** API calls with exponential backoff (30s/60s/120s) on transient errors; daemon never crashes from a single failure
 
 ## Statement Balance Computation
 
@@ -95,39 +96,44 @@ python ynab_balance_monitor.py [--dry-run | --daemon]
 | `APPRISE_URLS` | Yes | -- | Comma-separated [Apprise URLs](https://github.com/caronc/apprise/wiki) for alerts |
 | `UPDATE_APPRISE_URLS` | No | `APPRISE_URLS` | Separate Apprise URLs for routine updates |
 | `TZ` | No | `UTC` | Timezone for schedule (e.g. `America/Chicago`) |
+| `CACHE_DIR` | No | `/tmp/ynab-monitor` | Directory for disk cache (monthly expenses, delta sync) |
+| `NOTIFIARR_API_KEY` | No | -- | Notifiarr passthrough API key (for rich Discord embeds) |
+| `NOTIFIARR_CHANNEL_ID` | No | -- | Discord channel ID for alerts (required with `NOTIFIARR_API_KEY`) |
+| `NOTIFIARR_UPDATE_CHANNEL_ID` | No | `NOTIFIARR_CHANNEL_ID` | Separate channel for routine updates |
 | `DRY_RUN` | No | `false` | Skip notifications and CC updates (env var equivalent of `--dry-run`) |
 
 ## Example output
 
 ```
 ============================================================
-YNAB Balance Monitor -- 2026-02-24 19:13
-Projecting through 2026-04-25, min floor: $500.00
+YNAB Balance Monitor — 2026-03-15 08:00
+Projecting through 2026-05-14, min floor: $500.00
 ============================================================
+  Scheduled transactions: delta sync (knowledge 1234 → 1236)
 Account: My Checking 1234
   Balance: $11,686.73
 Account: Savings 5678
   Balance: $1,918.52
 Combined balance: $13,605.25
 
-Scheduled transactions through 2026-04-25: 28
-  2026-02-26  HOA (monthly)                               $   -274.95
-  2026-02-27  Transfer : Visa 9999 (monthly)              $ -2,902.05
-  2026-02-28  Employer Payroll (monthly)                   $  3,568.01
+Scheduled transactions through 2026-05-14: 28
+  2026-03-16  HOA (monthly)                               $   -274.95
+  2026-03-17  Transfer : Visa 9999 (monthly)              $ -2,902.05
+  2026-03-18  Employer Payroll (monthly)                   $  3,568.01
   ...
 
 Credit card payments to account for: $10,217.30
-  Visa 9999                       $  1,788.03 (statement (2026-01-25))
-  Discover 0000                   $      7.99 (statement (2026-02-09))
-  Amex 1111                       $  2,902.05 (statement (2026-02-02))
+  Visa 9999                       $  1,788.03 (statement (2026-02-25))
+  Discover 0000                   $      7.99 (statement (2026-03-09))
+  Amex 1111                       $  2,902.05 (statement (2026-03-02))
   ...
 
-Trailing 13-month expenses:
+Trailing 13-month expenses (cached):
      Average  $ 11,115.60/mo  ($365.16/day)
 Alert threshold (15d): $5,500
 Target threshold (30d): $11,000
 
 All CC payments are scheduled.
 
-Projected minimum balance: $4,930.03 on 2026-04-22
+Projected minimum balance: $4,930.03 on 2026-05-12
 ```
