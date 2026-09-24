@@ -19,6 +19,7 @@ Useful for keeping most of your cash in a high-yield savings account while makin
 8. Compares the minimum against **dynamic thresholds** based on trailing average daily expenses (cached 24h)
 9. If it drops below the alert threshold, sends a notification
 10. **Retries** API calls with exponential backoff (30s/60s/120s) on transient errors; daemon never crashes from a single failure
+11. Retries a failed Apprise delivery once after 5s; a failed notification is logged and never stops the container
 
 ## Statement Balance Computation
 
@@ -38,6 +39,31 @@ Thresholds are computed from trailing 13-month average daily expenses:
 
 - **Alert threshold** = `max(MIN_BALANCE, avg_daily_expenses * YNAB_ALERT_BUFFER_DAYS)` — fires a notification
 - **Target threshold** = `max(MIN_BALANCE, avg_daily_expenses * YNAB_TARGET_BUFFER_DAYS)` — the "comfortable" level
+
+In per-account mode (below), each account's own threshold replaces `MIN_BALANCE` as the floor.
+
+## Multiple Accounts
+
+Two ways to monitor more than one account:
+
+| Style | Variables | Behavior |
+|---|---|---|
+| Pooled (legacy) | `YNAB_ACCOUNT_ID=id1,id2` + `MIN_BALANCE` | One combined balance and one projection for all listed accounts. CC payments are deducted. |
+| Per-account | `YNAB_ACCOUNT_ID_CC` and/or `YNAB_ACCOUNT_ID_NO_CC` | Each account is projected and alerted on separately, with its own threshold floor. |
+
+Per-account format is `id:threshold,id2:threshold`. The threshold is in dollars and defaults to `0` when omitted.
+
+```bash
+# Checking pays the credit cards; savings does not
+YNAB_ACCOUNT_ID_CC=11111111-aaaa-bbbb-cccc-222222222222:500
+YNAB_ACCOUNT_ID_NO_CC=33333333-aaaa-bbbb-cccc-444444444444:1000
+```
+
+- `_CC` accounts have unscheduled CC payments deducted on day 1. Scheduled CC transfers show up as normal scheduled transactions on whichever account they are scheduled from.
+- `_NO_CC` accounts only see their own scheduled transactions.
+- Scheduled CC payment amounts are updated against the first `_CC` account.
+- `YNAB_ACCOUNT_ID` cannot be set together with the per-account variables.
+- Alerts and update notifications are sent per account and name the account.
 
 ## Setup
 
@@ -82,7 +108,9 @@ python ynab_balance_monitor.py [--dry-run | --daemon]
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `YNAB_API_TOKEN` | Yes | -- | YNAB Personal Access Token |
-| `YNAB_ACCOUNT_ID` | Yes | -- | Checking account ID(s) to monitor, comma-separated for multiple |
+| `YNAB_ACCOUNT_ID` | Yes* | -- | Checking account ID(s) to monitor, comma-separated; multiple IDs are pooled into one balance |
+| `YNAB_ACCOUNT_ID_CC` | Yes* | -- | Per-account monitoring with CC payments deducted, `id:threshold,id2` (see [Multiple Accounts](#multiple-accounts)) |
+| `YNAB_ACCOUNT_ID_NO_CC` | Yes* | -- | Per-account monitoring without CC payments, `id:threshold,id2` |
 | `YNAB_BUDGET_ID` | No | `last-used` | Budget ID (or `last-used`) |
 | `YNAB_CC_CLOSE_DATES` | No | -- | Statement close dates as `CardName:DayOfMonth` pairs, comma-separated |
 | `YNAB_CC_CREATE_PAYMENTS` | No | `false` | Auto-create scheduled CC payment transfers if none exist |
@@ -91,8 +119,8 @@ python ynab_balance_monitor.py [--dry-run | --daemon]
 | `MIN_BALANCE` | No | `0` | Minimum threshold floor in dollars |
 | `YNAB_ALERT_BUFFER_DAYS` | No | `5` | Alert if projected minimum covers fewer than this many days of expenses |
 | `YNAB_TARGET_BUFFER_DAYS` | No | `10` | Target buffer in days of expenses for "comfortable" level |
-| `SCHEDULE` | No | -- | `HH:MM` for daily, `Nh` for interval. Empty = run once |
-| `UPDATE_SCHEDULE` | No | -- | Separate schedule for routine balance update notifications |
+| `SCHEDULE` | No | -- | `HH:MM` for daily, `Nh` for interval. Empty = run once. Without `UPDATE_SCHEDULE`, an update digest is sent on every check |
+| `UPDATE_SCHEDULE` | No | -- | Separate schedule for routine balance update notifications; when set, checks on `SCHEDULE` only send alerts |
 | `APPRISE_URLS` | Yes | -- | Comma-separated [Apprise URLs](https://github.com/caronc/apprise/wiki) for alerts |
 | `UPDATE_APPRISE_URLS` | No | `APPRISE_URLS` | Separate Apprise URLs for routine updates |
 | `TZ` | No | `UTC` | Timezone for schedule (e.g. `America/Chicago`) |
@@ -101,6 +129,8 @@ python ynab_balance_monitor.py [--dry-run | --daemon]
 | `NOTIFIARR_CHANNEL_ID` | No | -- | Discord channel ID for alerts (required with `NOTIFIARR_API_KEY`) |
 | `NOTIFIARR_UPDATE_CHANNEL_ID` | No | `NOTIFIARR_CHANNEL_ID` | Separate channel for routine updates |
 | `DRY_RUN` | No | `false` | Skip notifications and CC updates (env var equivalent of `--dry-run`) |
+
+\* Set either `YNAB_ACCOUNT_ID` or at least one of `YNAB_ACCOUNT_ID_CC` / `YNAB_ACCOUNT_ID_NO_CC`, not both.
 
 ## Example output
 
