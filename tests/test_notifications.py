@@ -566,3 +566,72 @@ class TestUpdateAppriseMessage:
 
         notify_type = mock_notifier.return_value.notify.call_args[1]["notify_type"]
         assert notify_type == apprise.NotifyType.SUCCESS
+
+
+# ---------------------------------------------------------------------------
+# Alert notify_type and delivery-failure resilience
+# ---------------------------------------------------------------------------
+
+
+class TestAlertNotifyType:
+    @patch.object(m, "_notifiarr_configured", return_value=False)
+    @patch.object(m, "_build_notifier")
+    def test_warning_when_min_non_negative(self, mock_notifier, _mock_conf, alert_ctx):
+        import apprise
+
+        mock_notifier.return_value.notify.return_value = True
+        m.send_alert_notification(alert_ctx)
+        assert mock_notifier.return_value.notify.call_args[1]["notify_type"] == apprise.NotifyType.WARNING
+
+    @patch.object(m, "_notifiarr_configured", return_value=False)
+    @patch.object(m, "_build_notifier")
+    def test_failure_when_min_negative(self, mock_notifier, _mock_conf, alert_ctx):
+        import apprise
+
+        alert_ctx["min_balance"] = -150
+        mock_notifier.return_value.notify.return_value = True
+        m.send_alert_notification(alert_ctx)
+        assert mock_notifier.return_value.notify.call_args[1]["notify_type"] == apprise.NotifyType.FAILURE
+
+
+class TestAppriseFailureResilience:
+    @patch.object(m.time, "sleep")
+    @patch.object(m, "_notifiarr_configured", return_value=False)
+    @patch.object(m, "_build_notifier")
+    def test_alert_failure_does_not_exit_and_retries_once(self, mock_notifier, _mock_conf, mock_sleep, alert_ctx):
+        mock_notifier.return_value.notify.return_value = False
+        m.send_alert_notification(alert_ctx)  # must not raise SystemExit
+        assert mock_notifier.return_value.notify.call_count == 2
+        mock_sleep.assert_called_once_with(m._APPRISE_RETRY_DELAY)
+
+    @patch.object(m.time, "sleep")
+    @patch.object(m, "_notifiarr_configured", return_value=False)
+    @patch.object(m, "_build_notifier")
+    def test_retry_succeeds_on_second_attempt(self, mock_notifier, _mock_conf, _mock_sleep, alert_ctx):
+        mock_notifier.return_value.notify.side_effect = [False, True]
+        assert m._send_apprise("json://localhost", "t", "b", "warning") is True
+        assert mock_notifier.return_value.notify.call_count == 2
+
+    @patch.object(m, "_notifiarr_configured", return_value=False)
+    @patch.object(m, "_build_notifier")
+    def test_update_failure_does_not_exit(self, mock_notifier, _mock_conf, update_ctx_on_track):
+        mock_notifier.return_value.notify.return_value = False
+        with patch.object(m.time, "sleep"):
+            m.send_update_notification(update_ctx_on_track)
+
+    def test_no_valid_urls_returns_false_without_notify(self):
+        with patch.object(m.apprise.Apprise, "notify") as mock_notify:
+            assert m._send_apprise("not a url at all", "t", "b", "warning") is False
+        mock_notify.assert_not_called()
+
+    def test_failed_url_log_hides_token(self, capsys):
+        m._build_notifier("bogusscheme://secret-token-value")
+        err = capsys.readouterr().err
+        assert "bogusscheme://" in err
+        assert "secret-token-value" not in err
+
+    @patch.object(m, "_notifiarr_configured", return_value=True)
+    @patch.object(m, "_send_notifiarr", return_value=False)
+    def test_notifiarr_failure_without_apprise_does_not_exit(self, _mock_send, _mock_conf, alert_ctx):
+        with patch.object(m, "APPRISE_URLS", ""):
+            m.send_alert_notification(alert_ctx)

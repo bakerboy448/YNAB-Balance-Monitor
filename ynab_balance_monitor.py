@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""YNAB Balance Monitor - Projects minimum checking account balance and alerts via Apprise."""
+"""YNAB Balance Monitor - Projects minimum account balances and alerts via Apprise."""
 
 import calendar
 import json
+import logging
 import os
 import re
 import signal
 import sys
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -23,6 +25,9 @@ YNAB_BUDGET_ID = os.environ.get("YNAB_BUDGET_ID", "last-used")
 # Support single ID or comma-separated list for monitoring multiple accounts
 _account_id_raw = os.environ.get("YNAB_ACCOUNT_ID", "")
 YNAB_ACCOUNT_IDS = [aid.strip() for aid in _account_id_raw.split(",") if aid.strip()]
+# Per-account monitoring: "id:threshold,id2" (threshold in dollars, defaults to 0)
+YNAB_ACCOUNT_ID_CC = os.environ.get("YNAB_ACCOUNT_ID_CC", "")  # CC payments deducted
+YNAB_ACCOUNT_ID_NO_CC = os.environ.get("YNAB_ACCOUNT_ID_NO_CC", "")  # CC payments ignored
 YNAB_CC_CATEGORIES = os.environ.get("YNAB_CC_CATEGORIES", "")  # comma-separated IDs, empty = all
 YNAB_CC_CLOSE_DATES = os.environ.get("YNAB_CC_CLOSE_DATES", "")  # CardName:DayOfMonth pairs
 YNAB_CC_CREATE_PAYMENTS = os.environ.get("YNAB_CC_CREATE_PAYMENTS", "").lower() in ("true", "1", "yes")
@@ -51,6 +56,68 @@ USER_AGENT = f"YNAB-Balance-Monitor/{APP_VERSION} (+https://github.com/bakerboy4
 # Retry configuration
 _RETRY_MAX = 3
 _RETRY_BACKOFFS = [30, 60, 120]  # seconds
+_APPRISE_RETRY_DELAY = 5  # seconds
+
+
+@dataclass
+class MonitorTarget:
+    """One independent balance check.
+
+    Legacy YNAB_ACCOUNT_ID config produces a single target whose accounts are
+    pooled into one combined balance. YNAB_ACCOUNT_ID_CC / YNAB_ACCOUNT_ID_NO_CC
+    produce one target per account, each with its own threshold floor.
+    """
+
+    account_ids: list
+    min_balance: int
+    include_cc: bool = True
+    per_account: bool = False
+
+
+def _parse_account_entries(raw):
+    """Parse 'id:threshold,id2' into (account_id, min_balance) tuples.
+
+    Raises ValueError on a non-integer threshold.
+    """
+    entries = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            acct_id, threshold = part.split(":", 1)
+            entries.append((acct_id.strip(), int(threshold.strip())))
+        else:
+            entries.append((part, 0))
+    return entries
+
+
+def parse_monitor_targets(cc_raw=None, no_cc_raw=None, legacy_ids=None, legacy_min=None):
+    """Build the list of MonitorTargets from configuration.
+
+    YNAB_ACCOUNT_ID_CC / YNAB_ACCOUNT_ID_NO_CC take precedence; otherwise the
+    legacy YNAB_ACCOUNT_ID list becomes one pooled target floored by MIN_BALANCE.
+    Raises ValueError on malformed entries.
+    """
+    cc_raw = (YNAB_ACCOUNT_ID_CC if cc_raw is None else cc_raw).strip()
+    no_cc_raw = (YNAB_ACCOUNT_ID_NO_CC if no_cc_raw is None else no_cc_raw).strip()
+    legacy_ids = YNAB_ACCOUNT_IDS if legacy_ids is None else legacy_ids
+    legacy_min = MIN_BALANCE if legacy_min is None else legacy_min
+
+    if cc_raw or no_cc_raw:
+        targets = [
+            MonitorTarget([aid], threshold, include_cc=True, per_account=True)
+            for aid, threshold in _parse_account_entries(cc_raw)
+        ]
+        targets += [
+            MonitorTarget([aid], threshold, include_cc=False, per_account=True)
+            for aid, threshold in _parse_account_entries(no_cc_raw)
+        ]
+        return targets
+
+    if legacy_ids:
+        return [MonitorTarget(list(legacy_ids), legacy_min, include_cc=True)]
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -251,19 +318,21 @@ def get_end_date():
     return date(today.year, today.month, last_day)
 
 
-def get_account_balances(all_accounts=None):
-    """Get current balances for all monitored accounts.
+def get_account_balances(all_accounts=None, account_ids=None):
+    """Get current balances for the given accounts (default: YNAB_ACCOUNT_IDS).
 
     Returns tuple of (total_balance, list of account details).
     If all_accounts is provided (list of account dicts from /accounts),
     uses it instead of per-account API calls.
     """
+    if account_ids is None:
+        account_ids = YNAB_ACCOUNT_IDS
     total_balance = 0.0
     accounts = []
 
     if all_accounts is not None:
         acct_map = {a["id"]: a for a in all_accounts}
-        for account_id in YNAB_ACCOUNT_IDS:
+        for account_id in account_ids:
             account = acct_map.get(account_id)
             if not account:
                 raise YNABAPIError(f"Account {account_id} not found in budget")
@@ -276,7 +345,7 @@ def get_account_balances(all_accounts=None):
             print(f"Combined balance: ${total_balance:,.2f}")
         return total_balance, accounts
 
-    for account_id in YNAB_ACCOUNT_IDS:
+    for account_id in account_ids:
         data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts/{account_id}")
         account = data["account"]
         balance = milliunits_to_dollars(account["balance"])
@@ -369,13 +438,15 @@ def _expand_occurrences(next_date, frequency, start, end):
     return dates
 
 
-def get_scheduled_transactions(end_date, raw_scheduled=None):
-    """Get all scheduled transactions for the monitored account.
+def get_scheduled_transactions(end_date, raw_scheduled=None, account_ids=None):
+    """Get all scheduled transactions for the given accounts (default: YNAB_ACCOUNT_IDS).
 
     Expands recurring transactions into individual occurrences within the
     monitoring window. If raw_scheduled is provided, uses it instead of
     fetching from the API.
     """
+    if account_ids is None:
+        account_ids = YNAB_ACCOUNT_IDS
     if raw_scheduled is None:
         data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/scheduled_transactions")
         raw_scheduled = data["scheduled_transactions"]
@@ -391,8 +462,8 @@ def get_scheduled_transactions(end_date, raw_scheduled=None):
 
         # Include transactions ON a monitored account, OR transfers TO a
         # monitored account (stored on the other side, e.g. CC -> checking)
-        on_checking = acct_id in YNAB_ACCOUNT_IDS
-        xfer_to_checking = xfer_id in YNAB_ACCOUNT_IDS
+        on_checking = acct_id in account_ids
+        xfer_to_checking = xfer_id in account_ids
         if not on_checking and not xfer_to_checking:
             continue
 
@@ -559,14 +630,16 @@ def get_cc_payment_amounts(all_accounts=None):
     return cc_payments, total
 
 
-def get_cc_payment_history(cc_account_id, months_back=6):
+def get_cc_payment_history(cc_account_id, months_back=6, account_ids=None):
     """Get historical CC payment transactions to determine typical pay date.
 
-    Looks at transfers FROM checking TO this CC account.
+    Looks at transfers FROM checking (default: YNAB_ACCOUNT_IDS) TO this CC account.
     Returns the most common day-of-month for payments, or None if no history.
     """
     from collections import Counter
 
+    if account_ids is None:
+        account_ids = YNAB_ACCOUNT_IDS
     since_date = (datetime.now() - timedelta(days=months_back * 30)).strftime("%Y-%m-%d")
     data = ynab_get(f"/budgets/{YNAB_BUDGET_ID}/accounts/{cc_account_id}/transactions?since_date={since_date}")
 
@@ -575,7 +648,7 @@ def get_cc_payment_history(cc_account_id, months_back=6):
         if txn.get("deleted"):
             continue
         # Payment = transfer from checking (positive amount from CC's perspective)
-        if txn["amount"] > 0 and txn.get("transfer_account_id") in YNAB_ACCOUNT_IDS:
+        if txn["amount"] > 0 and txn.get("transfer_account_id") in account_ids:
             pay_date = datetime.strptime(txn["date"], "%Y-%m-%d").date()
             pay_days.append(pay_date.day)
 
@@ -585,7 +658,9 @@ def get_cc_payment_history(cc_account_id, months_back=6):
     return Counter(pay_days).most_common(1)[0][0]
 
 
-def update_cc_payment_amount(cc_account_id, cc_name, payment_amount, checking_account_id, raw_scheduled=None):
+def update_cc_payment_amount(
+    cc_account_id, cc_name, payment_amount, checking_account_id, raw_scheduled=None, account_ids=None
+):
     """Update the scheduled payment amount for a CC if it differs.
 
     Finds existing scheduled transfer from checking to this CC.
@@ -646,7 +721,7 @@ def update_cc_payment_amount(cc_account_id, cc_name, payment_amount, checking_ac
             print(f"  {cc_name}: already correct at ${payment_amount:,.2f}")
     else:
         if YNAB_CC_CREATE_PAYMENTS:
-            pay_day = get_cc_payment_history(cc_account_id)
+            pay_day = get_cc_payment_history(cc_account_id, account_ids=account_ids)
             if pay_day is None:
                 print(
                     f"  Warning: no payment history found for {cc_name}, cannot determine pay date — skipping creation"
@@ -689,13 +764,15 @@ def update_cc_payment_amount(cc_account_id, cc_name, payment_amount, checking_ac
             print(f"  Warning: no scheduled payment found for {cc_name}, skipping")
 
 
-def get_covered_cc_ids(raw_scheduled):
+def get_covered_cc_ids(raw_scheduled, account_ids=None):
     """Get all scheduled CC transfer account IDs (regardless of date).
 
     Returns a set of CC account IDs that have a scheduled transfer
-    from/to any monitored checking account.
+    from/to any monitored account (default: YNAB_ACCOUNT_IDS).
     raw_scheduled: list of scheduled transaction dicts from the API.
     """
+    if account_ids is None:
+        account_ids = YNAB_ACCOUNT_IDS
     covered = set()
     for txn in raw_scheduled:
         if txn.get("deleted"):
@@ -705,10 +782,10 @@ def get_covered_cc_ids(raw_scheduled):
         if not xfer:
             continue
         # Transfer from checking to CC
-        if acct in YNAB_ACCOUNT_IDS:
+        if acct in account_ids:
             covered.add(xfer)
         # Transfer from CC to checking (stored on CC side)
-        if xfer in YNAB_ACCOUNT_IDS:
+        if xfer in account_ids:
             covered.add(acct)
     return covered
 
@@ -889,7 +966,7 @@ def fetch_scheduled_transactions_delta():
     return data["scheduled_transactions"]
 
 
-def get_dynamic_thresholds(avg_daily_expenses):
+def get_dynamic_thresholds(avg_daily_expenses, floor=None):
     """Compute alert and target thresholds for the projected minimum.
 
     The projected minimum is the balance AFTER all known obligations clear.
@@ -898,12 +975,15 @@ def get_dynamic_thresholds(avg_daily_expenses):
     - alert: YNAB_ALERT_BUFFER_DAYS (default 5) — transfer from HYSA now
     - target: YNAB_TARGET_BUFFER_DAYS (default 10) — consider transferring
 
-    MIN_BALANCE is used as a floor.
+    floor (default MIN_BALANCE) is the minimum for both thresholds; per-account
+    configs pass their own threshold here.
 
     Returns (alert_threshold, target_threshold).
     """
-    alert_threshold = round(max(MIN_BALANCE, avg_daily_expenses * YNAB_ALERT_BUFFER_DAYS), -2)
-    target_threshold = round(max(MIN_BALANCE, avg_daily_expenses * YNAB_TARGET_BUFFER_DAYS), -2)
+    if floor is None:
+        floor = MIN_BALANCE
+    alert_threshold = round(max(floor, avg_daily_expenses * YNAB_ALERT_BUFFER_DAYS), -2)
+    target_threshold = round(max(floor, avg_daily_expenses * YNAB_TARGET_BUFFER_DAYS), -2)
     return alert_threshold, target_threshold
 
 
@@ -912,14 +992,49 @@ def get_dynamic_thresholds(avg_daily_expenses):
 # ---------------------------------------------------------------------------
 
 
+def _configure_logging():
+    """Surface Apprise's internal errors (network, auth) in the container log."""
+    logging.basicConfig(stream=sys.stderr, level=logging.WARNING, format="%(name)s: %(message)s")
+    logging.getLogger("apprise").setLevel(logging.INFO)
+
+
 def _build_notifier(urls_str):
     """Build an Apprise notifier from a comma-separated URL string."""
     notifier = apprise.Apprise()
     for url in urls_str.split(","):
         url = url.strip()
-        if url:
-            notifier.add(url)
+        if url and not notifier.add(url):
+            # Log only the scheme: the rest of an Apprise URL usually holds tokens
+            scheme = url.split("://", 1)[0] if "://" in url else "?"
+            print(f"Apprise: failed to load {scheme}:// URL", file=sys.stderr)
     return notifier
+
+
+def _send_apprise(urls_str, title, body, notify_type):
+    """Send via Apprise, retrying once on failure.
+
+    Returns True on success, False on failure. Never exits the process, so a
+    failed delivery does not take down the daemon.
+    """
+    notifier = _build_notifier(urls_str)
+    if not notifier:  # Apprise is falsy when no URLs loaded
+        print("Apprise: no valid notification URLs loaded", file=sys.stderr)
+        return False
+
+    for attempt in range(2):
+        if notifier.notify(title=title, body=body, notify_type=notify_type) is True:
+            return True
+        if attempt == 0:
+            print(f"Apprise: notification failed, retrying in {_APPRISE_RETRY_DELAY}s...", file=sys.stderr)
+            time.sleep(_APPRISE_RETRY_DELAY)
+
+    print("Apprise: notification failed after retry", file=sys.stderr)
+    return False
+
+
+def _label(ctx, default):
+    """Account label for notification text; legacy pooled mode keeps the generic default."""
+    return ctx.get("account_label") or default
 
 
 def _notifiarr_configured():
@@ -979,8 +1094,12 @@ def _build_notification_context(
     transactions,
     cc_payments,
     covered_cc_ids=None,
+    account_label=None,
 ):
     """Collect all notification data into a single context dict.
+
+    account_label: account name shown in notifications (per-account mode);
+    None keeps the generic "checking" wording.
 
     covered_cc_ids: set of CC account IDs that have scheduled transfers.
     These are excluded from cc_payments display since they already appear
@@ -1015,6 +1134,7 @@ def _build_notification_context(
         tagged_cc[cc_id] = {**info, "scheduled": bool(covered_cc_ids and cc_id in covered_cc_ids)}
 
     return {
+        "account_label": account_label,
         "current_balance": balance,
         "accounts": accounts,
         "min_balance": min_balance,
@@ -1054,7 +1174,7 @@ def _build_notifiarr_alert_payload(ctx):
     daily_text = f"${ctx['avg_daily_expenses']:,.0f}/day"
 
     description = (
-        f"After all scheduled bills and CC payments, checking will bottom out at "
+        f"After all scheduled bills and CC payments, {_label(ctx, 'checking')} will bottom out at "
         f"**{_fmt_dollars(min_bal)}** on **{min_date_str}** — "
         f"that's {_fmt_dollars(shortfall)} less than the {ctx['alert_buffer_days']}-day "
         f"spending cushion ({_fmt_dollars(ctx['alert_threshold'])})."
@@ -1104,7 +1224,7 @@ def _build_notifiarr_alert_payload(ctx):
 
     # Action
     action = (
-        f"Transfer **{_fmt_dollars(transfer)}** from HYSA \u2192 checking before "
+        f"Transfer **{_fmt_dollars(transfer)}** from HYSA \u2192 {_label(ctx, 'checking')} before "
         f"{min_date_str} to maintain {ctx['target_buffer_days']}-day cushion."
     )
     fields.append({"title": "Action", "text": action, "inline": False})
@@ -1118,7 +1238,7 @@ def _build_notifiarr_alert_payload(ctx):
         "discord": {
             "color": color,
             "text": {
-                "title": f"Transfer {_fmt_dollars(transfer)} to Checking",
+                "title": f"Transfer {_fmt_dollars(transfer)} to {_label(ctx, 'Checking')}",
                 "description": description,
                 "fields": fields,
                 "footer": f"{APP_NAME} v{APP_VERSION} \u2022 Through {ctx['end_date'].strftime('%b %d, %Y')}",
@@ -1149,7 +1269,7 @@ def _build_notifiarr_update_payload(ctx):
     daily_text = f"${ctx['avg_daily_expenses']:,.0f}/day"
 
     description = (
-        f"After all scheduled bills and CC payments clear, checking bottoms out at "
+        f"After all scheduled bills and CC payments clear, {_label(ctx, 'checking')} bottoms out at "
         f"**{_fmt_dollars(min_bal)}** on **{min_date_str}** — "
         f"that covers {buf_text}."
     )
@@ -1198,7 +1318,7 @@ def _build_notifiarr_update_payload(ctx):
         "discord": {
             "color": color,
             "text": {
-                "title": f"Checking \u2014 {status}",
+                "title": f"{_label(ctx, 'Checking')} \u2014 {status}",
                 "description": description,
                 "fields": fields,
                 "footer": f"{APP_NAME} v{APP_VERSION} \u2022 Through {ctx['end_date'].strftime('%b %d, %Y')}",
@@ -1217,17 +1337,17 @@ def send_alert_notification(ctx):
             return
         if not APPRISE_URLS:
             print("Notifiarr failed and no Apprise URLs configured", file=sys.stderr)
-            sys.exit(1)
+            return
         print("Notifiarr failed, falling back to Apprise", file=sys.stderr)
 
     shortfall = ctx["shortfall"]
     transfer = ctx["transfer_to_target"]
     min_bal = ctx["min_balance"]
     daily = ctx["avg_daily_expenses"]
-    title = f"{APP_NAME}: Transfer {_fmt_dollars(transfer)} to checking"
+    title = f"{APP_NAME}: Transfer {_fmt_dollars(transfer)} to {_label(ctx, 'checking')}"
 
     lines = [
-        f"After all scheduled bills and CC payments, checking bottoms out at "
+        f"After all scheduled bills and CC payments, {_label(ctx, 'checking')} bottoms out at "
         f"{_fmt_dollars(min_bal)} on {ctx['min_date'].strftime('%b %d')} — "
         f"that's {_fmt_dollars(shortfall)} below the alert cushion.",
         "",
@@ -1258,19 +1378,18 @@ def send_alert_notification(ctx):
             lines.append(f"  {p['name']}: {_fmt_dollars(p['amount'])}{tag}")
     lines.append("")
     lines.append(
-        f"Action: Transfer {_fmt_dollars(transfer)} from HYSA -> checking before "
+        f"Action: Transfer {_fmt_dollars(transfer)} from HYSA -> {_label(ctx, 'checking')} before "
         f"{ctx['min_date'].strftime('%b %d')} to maintain {ctx['target_buffer_days']}-day cushion."
     )
     message = "\n".join(lines)
 
-    notifier = _build_notifier(APPRISE_URLS)
-    notify_type = apprise.NotifyType.WARNING if min_bal < 0 else apprise.NotifyType.INFO
+    # Some Apprise plugins map notify_type to priority and reject INFO for alerts
+    notify_type = apprise.NotifyType.FAILURE if min_bal < 0 else apprise.NotifyType.WARNING
 
-    if not notifier.notify(title=title, body=message, notify_type=notify_type):
+    if _send_apprise(APPRISE_URLS, title, message, notify_type):
+        print("\nAlert notification sent via Apprise")
+    else:
         print("Failed to send alert via Apprise", file=sys.stderr)
-        sys.exit(1)
-
-    print("\nAlert notification sent via Apprise")
 
 
 def send_update_notification(ctx):
@@ -1292,7 +1411,7 @@ def send_update_notification(ctx):
         status = "Below Target"
     else:
         status = "On Track"
-    title = f"{APP_NAME}: Checking \u2014 {status}"
+    title = f"{APP_NAME}: {_label(ctx, 'Checking')} \u2014 {status}"
 
     buf_days = ctx["buffer_days_remaining"]
     buf_text = f"~{buf_days:.0f} days" if buf_days < 999 else "999+ days"
@@ -1300,7 +1419,7 @@ def send_update_notification(ctx):
     min_date_str = ctx["min_date"].strftime("%b %d")
 
     lines = [
-        f"After all scheduled bills and CC payments, checking bottoms out at "
+        f"After all scheduled bills and CC payments, {_label(ctx, 'checking')} bottoms out at "
         f"{_fmt_dollars(min_bal)} on {min_date_str} \u2014 that covers {buf_text} of spending.",
         "",
         f"Balance now: {_fmt_dollars(ctx['current_balance'])}",
@@ -1327,13 +1446,12 @@ def send_update_notification(ctx):
     message = "\n".join(lines)
 
     urls = UPDATE_APPRISE_URLS or APPRISE_URLS
-    notifier = _build_notifier(urls)
     notify_type = apprise.NotifyType.WARNING if min_bal < ctx["alert_threshold"] else apprise.NotifyType.SUCCESS
 
-    if not notifier.notify(title=title, body=message, notify_type=notify_type):
-        print("Failed to send update notification via Apprise", file=sys.stderr)
-    else:
+    if _send_apprise(urls, title, message, notify_type):
         print("\nUpdate notification sent via Apprise")
+    else:
+        print("Failed to send update notification via Apprise", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -1353,12 +1471,20 @@ def validate_config():
     errors = []
     if not YNAB_API_TOKEN:
         errors.append("YNAB_API_TOKEN is required")
-    if not YNAB_ACCOUNT_IDS:
-        errors.append("YNAB_ACCOUNT_ID is required (single ID or comma-separated list)")
-    else:
-        for aid in YNAB_ACCOUNT_IDS:
+    per_account_set = bool(YNAB_ACCOUNT_ID_CC.strip() or YNAB_ACCOUNT_ID_NO_CC.strip())
+    if per_account_set and YNAB_ACCOUNT_IDS:
+        errors.append("YNAB_ACCOUNT_ID cannot be combined with YNAB_ACCOUNT_ID_CC/YNAB_ACCOUNT_ID_NO_CC")
+    try:
+        targets = parse_monitor_targets()
+    except ValueError as e:
+        errors.append(f"YNAB_ACCOUNT_ID_CC/YNAB_ACCOUNT_ID_NO_CC threshold must be an integer: {e}")
+        targets = None
+    if targets is not None and not targets:
+        errors.append("No accounts configured: set YNAB_ACCOUNT_ID, YNAB_ACCOUNT_ID_CC, or YNAB_ACCOUNT_ID_NO_CC")
+    for target in targets or []:
+        for aid in target.account_ids:
             if not _is_valid_uuid(aid):
-                errors.append(f"YNAB_ACCOUNT_ID contains invalid UUID: '{aid}'")
+                errors.append(f"Account ID is not a valid UUID: '{aid}'")
     if not _is_valid_uuid(YNAB_BUDGET_ID):
         errors.append(f"YNAB_BUDGET_ID must be a valid UUID or 'last-used', got: '{YNAB_BUDGET_ID}'")
     if not APPRISE_URLS and not _notifiarr_configured():
@@ -1378,18 +1504,23 @@ def validate_config():
         sys.exit(1)
 
 
-def run_check(send_update=False):
-    """Run one balance check cycle.
+def run_check(send_update=False, targets=None):
+    """Run one balance check cycle for every monitor target.
 
-    Fetches accounts and scheduled transactions once and passes them through
-    to avoid duplicate API calls. Uses delta sync for scheduled transactions
-    and disk cache for monthly expenses.
+    Budget-wide data (accounts, scheduled transactions, CC payments, monthly
+    expenses) is fetched once and shared across targets. Uses delta sync for
+    scheduled transactions and disk cache for monthly expenses.
     """
+    if targets is None:
+        targets = parse_monitor_targets()
     end_date = get_end_date()
 
     print("=" * 60)
     print(f"YNAB Balance Monitor — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print(f"Projecting through {end_date}, min floor: ${MIN_BALANCE:,.2f}")
+    if len(targets) == 1 and not targets[0].per_account:
+        print(f"Projecting through {end_date}, min floor: ${targets[0].min_balance:,.2f}")
+    else:
+        print(f"Projecting through {end_date}, {len(targets)} account(s)")
     print("=" * 60)
 
     # Fetch shared data once
@@ -1397,14 +1528,16 @@ def run_check(send_update=False):
     all_accounts = accounts_data["accounts"]
     raw_scheduled = fetch_scheduled_transactions_delta()
 
-    balance, accounts = get_account_balances(all_accounts=all_accounts)
-    transactions = get_scheduled_transactions(end_date, raw_scheduled=raw_scheduled)
-    cc_payments, _ = get_cc_payment_amounts(all_accounts=all_accounts)
+    monitored_ids = [aid for t in targets for aid in t.account_ids]
+    cc_targets = [t for t in targets if t.include_cc]
 
-    # Update CC scheduled payment amounts
-    if YNAB_ACCOUNT_IDS:
+    if cc_targets:
+        cc_payments, _ = get_cc_payment_amounts(all_accounts=all_accounts)
+        cc_account_ids = [aid for t in cc_targets for aid in t.account_ids]
+
+        # Update CC scheduled payment amounts against the primary CC-paying account
         print("\nChecking CC payment amounts...")
-        checking_id = YNAB_ACCOUNT_IDS[0]  # Primary checking account
+        checking_id = cc_account_ids[0]
         for cc_id, payment_info in cc_payments.items():
             if payment_info["amount"] > 0:
                 update_cc_payment_amount(
@@ -1413,15 +1546,42 @@ def run_check(send_update=False):
                     payment_info["amount"],
                     checking_id,
                     raw_scheduled=raw_scheduled,
+                    account_ids=cc_account_ids,
                 )
+    else:
+        cc_payments = {}
 
-    # Calculate dynamic thresholds based on last month's actual expenses
+    # Calculate dynamic thresholds based on trailing monthly expenses
     avg_daily, avg_monthly = calculate_monthly_expenses()
-    alert_threshold, target_threshold = get_dynamic_thresholds(avg_daily)
+
+    # A CC with a scheduled transfer from/to ANY monitored account is covered
+    covered_cc_ids = get_covered_cc_ids(raw_scheduled, account_ids=monitored_ids)
+
+    for target in targets:
+        _check_target(
+            target,
+            send_update=send_update,
+            all_accounts=all_accounts,
+            raw_scheduled=raw_scheduled,
+            cc_payments=cc_payments if target.include_cc else {},
+            covered_cc_ids=covered_cc_ids,
+            avg_daily=avg_daily,
+            end_date=end_date,
+        )
+
+
+def _check_target(target, send_update, all_accounts, raw_scheduled, cc_payments, covered_cc_ids, avg_daily, end_date):
+    """Project, compare against thresholds, and notify for one MonitorTarget."""
+    if target.per_account:
+        print(f"\n{'-' * 40}")
+
+    balance, accounts = get_account_balances(all_accounts=all_accounts, account_ids=target.account_ids)
+    transactions = get_scheduled_transactions(end_date, raw_scheduled=raw_scheduled, account_ids=target.account_ids)
+
+    alert_threshold, target_threshold = get_dynamic_thresholds(avg_daily, floor=target.min_balance)
     print(f"Alert threshold ({YNAB_ALERT_BUFFER_DAYS}d): ${alert_threshold:,.0f}")
     print(f"Target threshold ({YNAB_TARGET_BUFFER_DAYS}d): ${target_threshold:,.0f}")
 
-    covered_cc_ids = get_covered_cc_ids(raw_scheduled)
     min_balance, min_date, covered_cc_ids = project_minimum_balance(
         balance,
         transactions,
@@ -1430,6 +1590,7 @@ def run_check(send_update=False):
         covered_cc_ids=covered_cc_ids,
     )
 
+    label = accounts[0]["name"] if target.per_account else None
     ctx = _build_notification_context(
         balance=balance,
         accounts=accounts,
@@ -1442,14 +1603,16 @@ def run_check(send_update=False):
         transactions=transactions,
         cc_payments=cc_payments,
         covered_cc_ids=covered_cc_ids,
+        account_label=label,
     )
 
+    name = f"{label} projected balance" if label else "Projected balance"
     if min_balance < alert_threshold:
         shortfall = alert_threshold - min_balance
-        print(f"\n⚠ ALERT: Projected balance drops ${shortfall:,.0f} below alert threshold!")
+        print(f"\n⚠ ALERT: {name} drops ${shortfall:,.0f} below alert threshold!")
         send_alert_notification(ctx)
     else:
-        print(f"\n✓ Balance stays above ${alert_threshold:,.0f} alert threshold.")
+        print(f"\n✓ {name} stays above ${alert_threshold:,.0f} alert threshold.")
 
     if send_update:
         send_update_notification(ctx)
@@ -1515,6 +1678,11 @@ def _describe_schedule(label, parsed):
         print(f"{label}: daily at {hour:02d}:{minute:02d}")
 
 
+def _should_send_update(do_check, do_update, update_schedule):
+    """Send the digest when UPDATE_SCHEDULE fires, or on every check when UPDATE_SCHEDULE is unset."""
+    return do_update or (do_check and update_schedule is None)
+
+
 def main():
     validate_config()
 
@@ -1576,10 +1744,9 @@ def main():
         do_update = next_update is not None and now >= next_update
 
         # Run the projection (always checks alert threshold; optionally sends
-        # an update notification when the update schedule fires).
-        # Catch transient errors so the daemon keeps running.
+        # an update notification). Catch transient errors so the daemon keeps running.
         try:
-            run_check(send_update=do_update)
+            run_check(send_update=_should_send_update(do_check, do_update, update_schedule))
         except YNABAPIError as e:
             print(f"\nCheck failed (will retry on next schedule): {e}", file=sys.stderr)
         except Exception as e:
@@ -1599,6 +1766,7 @@ if __name__ == "__main__":
     group.add_argument("--dry-run", action="store_true", help="Run once immediately, skip notifications and CC updates")
     group.add_argument("--daemon", action="store_true", help="Run on SCHEDULE (default when SCHEDULE env var is set)")
     args = parser.parse_args()
+    _configure_logging()
 
     if args.dry_run:
         DRY_RUN = True
