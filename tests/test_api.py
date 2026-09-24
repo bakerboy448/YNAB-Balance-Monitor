@@ -178,21 +178,22 @@ class TestDeduplication:
     @patch("ynab_balance_monitor.ynab_get")
     def test_get_scheduled_transactions_uses_prefetched(self, mock_get):
         """get_scheduled_transactions should not call API when raw_scheduled is provided."""
-        from datetime import date
+        from datetime import date, timedelta
 
+        next_date = date.today() + timedelta(days=1)
         raw = [
             {
                 "account_id": m.YNAB_ACCOUNT_IDS[0],
                 "transfer_account_id": None,
                 "deleted": False,
-                "date_next": "2026-04-01",
+                "date_next": next_date.isoformat(),
                 "frequency": "never",
                 "amount": -100000,
                 "payee_name": "Test Payee",
             }
         ]
 
-        result = m.get_scheduled_transactions(date(2026, 4, 30), raw_scheduled=raw)
+        result = m.get_scheduled_transactions(next_date + timedelta(days=30), raw_scheduled=raw)
         mock_get.assert_not_called()
         assert len(result) == 1
         assert result[0]["payee"] == "Test Payee"
